@@ -1,0 +1,1173 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>MFG FTFR 분석 V005</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", sans-serif; }
+  .tabular-nums { font-variant-numeric: tabular-nums; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: #f1f5f9; }
+  ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+</style>
+</head>
+<body class="bg-gray-100">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+const STORAGE_KEY = 'mfg_ftfr_config_v2';
+const APP_VERSION = 'V005';
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const LINE_GROUPS = ['TCP', 'FE'];
+
+const loadConfig = () => {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    return saved ? JSON.parse(saved) : {};
+  } catch { return {}; }
+};
+const saveConfig = (cfg) => {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); } catch {}
+};
+
+const parseDate = (v) => {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  if (typeof v === 'number') {
+    const d = new Date(Math.round((v - 25569) * 86400 * 1000));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+};
+
+const fmtNum = (n) => {
+  if (!n || isNaN(n)) return '-';
+  return Math.round(n).toLocaleString();
+};
+const fmtPct = (n) => {
+  // FTFR ppm 표기 (재작업/총수량 × 1,000,000)
+  if (n === null || n === undefined || isNaN(n)) return '-';
+  return Math.round(n).toLocaleString();
+};
+const sumArr = (arr) => arr.reduce((a, b) => a + b, 0);
+
+// ─────────── FILE UPLOAD ───────────
+function FileUpload({ onLoad }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [dragOver, setDragOver] = useState(false);
+  
+  const handleFile = useCallback(async (file) => {
+    if (!file) return;
+    setLoading(true); setError('');
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array', cellDates: true });
+      for (const s of ['양품', '불량', '재작업']) {
+        if (!wb.SheetNames.includes(s)) {
+          throw new Error(`'${s}' 시트가 없습니다. (있는 시트: ${wb.SheetNames.join(', ')})`);
+        }
+      }
+      const good = XLSX.utils.sheet_to_json(wb.Sheets['양품']);
+      const defect = XLSX.utils.sheet_to_json(wb.Sheets['불량']);
+      const rework = XLSX.utils.sheet_to_json(wb.Sheets['재작업']);
+      
+      const normGood = good.map(r => ({
+        date: parseDate(r['생산일자']),
+        line: String(r['라인(New)'] || '').trim(),
+        process: String(r['공정(New)'] || '').trim(),
+        part: String(r['Part'] || '').trim(),
+        qty: Number(r['양품수량'] || 0)
+      })).filter(r => r.date && r.process);
+      
+      const normDef = defect.map(r => ({
+        date: parseDate(r['일자']),
+        line: String(r['라인(New)'] || '').trim(),
+        process: String(r['공정(New)'] || '').trim(),
+        part: String(r['Part'] || '').trim(),
+        station: String(r['STATION'] || '').trim(),
+        type: String(r['유형'] || '').trim(),
+        qty: Number(r['수량'] || 0)
+      })).filter(r => r.date && r.process);
+      
+      const normRew = rework.map(r => ({
+        date: parseDate(r['일자']),
+        line: String(r['라인(New)'] || '').trim(),
+        process: String(r['공정(New)'] || '').trim(),
+        part: String(r['Part'] || '').trim(),
+        station: String(r['STATION'] || '').trim(),
+        type: String(r['유형'] || '').trim(),
+        qty: Number(r['수량'] || 0)
+      })).filter(r => r.date && r.process);
+      
+      onLoad({ good: normGood, defect: normDef, rework: normRew, fileName: file.name });
+    } catch (e) {
+      setError(e.message || '파일 읽기 실패');
+    } finally {
+      setLoading(false);
+    }
+  }, [onLoad]);
+  
+  return (
+    <div className="bg-white p-8 rounded-xl shadow-md">
+      <label className="block">
+        <div 
+          className={`border-4 border-dashed rounded-xl p-16 text-center transition cursor-pointer ${dragOver ? 'border-emerald-500 bg-emerald-50' : 'border-gray-300 hover:border-emerald-400'}`}
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault(); setDragOver(false);
+            if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+          }}>
+          <div className="text-6xl mb-4">📊</div>
+          <div className="text-2xl font-bold text-gray-700">FTFR 엑셀 파일 업로드</div>
+          <div className="text-sm text-gray-500 mt-3">
+            <span className="bg-gray-100 px-2 py-1 rounded mx-1">양품</span>
+            <span className="bg-gray-100 px-2 py-1 rounded mx-1">불량</span>
+            <span className="bg-gray-100 px-2 py-1 rounded mx-1">재작업</span>
+            시트 (공정(New) / 라인(New) / Part 컬럼 사용)
+          </div>
+          {loading && <div className="text-blue-600 mt-6 font-bold">⏳ 로딩 중...</div>}
+          {error && <div className="text-red-600 mt-6 font-bold">❌ {error}</div>}
+        </div>
+        <input type="file" accept=".xlsx,.xls" className="hidden" onChange={(e) => {
+          if (e.target.files[0]) handleFile(e.target.files[0]);
+          e.target.value = '';
+        }} />
+      </label>
+      <div className="mt-6 p-4 bg-emerald-50 border-l-4 border-emerald-500 rounded">
+        <h3 className="font-bold text-emerald-800 mb-2">📐 FTFR 계산식</h3>
+        <div className="text-sm text-gray-700 space-y-1">
+          <div>• <b>FTFR(ppm)</b> = 재작업 ÷ 총수량 × 1,000,000</div>
+          <div>• <b>총수량(투입)</b> = 양품 + 불량</div>
+          <div>• 공정(New)별 Station / 불량유형 / 재작업유형 선택해 집계 범위 지정</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────── APP ───────────
+function App() {
+  const [data, setData] = useState(null);
+  const [year, setYear] = useState(null);
+  const [tab, setTab] = useState('main');
+  const [lineFilter, setLineFilter] = useState('all');
+  const [config, setConfig] = useState(loadConfig);
+  const [showConfig, setShowConfig] = useState(false);
+  
+  const availableYears = useMemo(() => {
+    if (!data) return [];
+    const set = new Set();
+    [...data.good, ...data.defect, ...data.rework].forEach(r => {
+      if (r.date) set.add(r.date.getFullYear());
+    });
+    return [...set].sort((a, b) => b - a);
+  }, [data]);
+  
+  useEffect(() => {
+    if (data && availableYears.length && !year) setYear(availableYears[0]);
+  }, [data, availableYears, year]);
+  
+  const processInfo = useMemo(() => {
+    if (!data) return {};
+    const m = {};
+    [...data.good, ...data.defect, ...data.rework].forEach(r => {
+      if (!r.process) return;
+      if (!m[r.process]) {
+        m[r.process] = { line: r.line, stations: new Set(), defectTypes: new Set(), reworkTypes: new Set(), parts: new Set() };
+      }
+      if (r.line && !m[r.process].line) m[r.process].line = r.line;
+      if (r.part) m[r.process].parts.add(r.part);
+    });
+    data.defect.forEach(r => {
+      if (!r.process || !m[r.process]) return;
+      if (r.station) m[r.process].stations.add(r.station);
+      if (r.type) m[r.process].defectTypes.add(r.type);
+    });
+    data.rework.forEach(r => {
+      if (!r.process || !m[r.process]) return;
+      if (r.station) m[r.process].stations.add(r.station);
+      if (r.type) m[r.process].reworkTypes.add(r.type);
+    });
+    const out = {};
+    for (const p in m) {
+      out[p] = {
+        line: m[p].line,
+        stations: [...m[p].stations].sort(),
+        defectTypes: [...m[p].defectTypes].sort(),
+        reworkTypes: [...m[p].reworkTypes].sort(),
+        parts: [...m[p].parts].sort()
+      };
+    }
+    return out;
+  }, [data]);
+  
+  const processes = useMemo(() => Object.keys(processInfo).sort(), [processInfo]);
+  
+  const filteredProcesses = useMemo(() => {
+    if (lineFilter === 'all') return processes;
+    return processes.filter(p => processInfo[p]?.line === lineFilter);
+  }, [processes, processInfo, lineFilter]);
+  
+  const isIncluded = useCallback((process, station, type, kind) => {
+    const c = config[process];
+    if (!c) return true;
+    if (c.stations && c.stations.length > 0 && !c.stations.includes(station)) return false;
+    const tk = kind === 'defect' ? 'defectTypes' : 'reworkTypes';
+    if (c[tk] && c[tk].length > 0 && !c[tk].includes(type)) return false;
+    return true;
+  }, [config]);
+  
+  const processStats = useMemo(() => {
+    if (!data || !year) return {};
+    const result = {};
+    processes.forEach(p => {
+      result[p] = {
+        line: processInfo[p].line,
+        good: Array(12).fill(0),
+        defect: Array(12).fill(0),
+        rework: Array(12).fill(0),
+      };
+    });
+    data.good.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!result[r.process]) return;
+      result[r.process].good[r.date.getMonth()] += r.qty;
+    });
+    data.defect.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!result[r.process]) return;
+      if (!isIncluded(r.process, r.station, r.type, 'defect')) return;
+      result[r.process].defect[r.date.getMonth()] += r.qty;
+    });
+    data.rework.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!result[r.process]) return;
+      if (!isIncluded(r.process, r.station, r.type, 'rework')) return;
+      result[r.process].rework[r.date.getMonth()] += r.qty;
+    });
+    return result;
+  }, [data, year, processes, processInfo, isIncluded]);
+  
+  const activeProcesses = useMemo(() => {
+    return filteredProcesses.filter(p => {
+      const s = processStats[p];
+      if (!s) return false;
+      return sumArr(s.good) + sumArr(s.defect) + sumArr(s.rework) > 0;
+    });
+  }, [filteredProcesses, processStats]);
+  
+  if (!data) {
+    return (
+      <div className="min-h-screen p-6">
+        <div className="max-w-4xl mx-auto">
+          <h1 className="text-3xl font-bold text-gray-800 mb-6">
+            📈 MFG FTFR 분석 <span className="text-sm text-gray-400 font-normal ml-2">{APP_VERSION}</span>
+          </h1>
+          <FileUpload onLoad={setData} />
+        </div>
+      </div>
+    );
+  }
+  
+  return (
+    <div className="min-h-screen p-6">
+      <div className="max-w-[1700px] mx-auto">
+        <Header data={data} year={year} setYear={setYear} availableYears={availableYears}
+          lineFilter={lineFilter} setLineFilter={setLineFilter}
+          tab={tab} setTab={setTab}
+          onShowConfig={() => setShowConfig(true)}
+          onReset={() => { setData(null); setYear(null); }} />
+        
+        {tab === 'main' && (
+          <MainTab year={year} data={data} activeProcesses={activeProcesses}
+            processStats={processStats} processInfo={processInfo}
+            isIncluded={isIncluded} lineFilter={lineFilter} />
+        )}
+        {tab === 'detail' && (
+          <DetailTab data={data} year={year} activeProcesses={activeProcesses}
+            processStats={processStats} processInfo={processInfo}
+            isIncluded={isIncluded} lineFilter={lineFilter} />
+        )}
+        
+        {showConfig && (
+          <ConfigModal processes={processes} processInfo={processInfo}
+            config={config}
+            onChange={(c) => { setConfig(c); saveConfig(c); }}
+            onClose={() => setShowConfig(false)} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─────────── HEADER ───────────
+function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter, tab, setTab, onShowConfig, onReset }) {
+  return (
+    <div className="mb-6">
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+        <div>
+          <h1 className="text-3xl font-bold text-gray-800">
+            📈 MFG FTFR 분석 <span className="text-sm text-gray-400 font-normal ml-2">{APP_VERSION}</span>
+          </h1>
+          <div className="text-xs text-gray-500 mt-1">
+            📁 {data.fileName} · 양품 {data.good.length.toLocaleString()}행 · 불량 {data.defect.length.toLocaleString()}행 · 재작업 {data.rework.length.toLocaleString()}행
+          </div>
+        </div>
+        <div className="flex gap-2 items-center flex-wrap">
+          <select value={year || ''} onChange={(e) => setYear(Number(e.target.value))}
+            className="px-3 py-2 border rounded-lg shadow-sm font-bold text-base bg-white">
+            {availableYears.map(y => <option key={y} value={y}>{y}년</option>)}
+          </select>
+          <div className="bg-white border rounded-lg shadow-sm p-1 flex gap-1">
+            {['all', 'TCP', 'FE'].map(v => (
+              <button key={v} onClick={() => setLineFilter(v)}
+                className={`px-3 py-1 rounded text-sm font-bold transition ${lineFilter === v ? 'bg-emerald-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>
+                {v === 'all' ? '전체' : v}
+              </button>
+            ))}
+          </div>
+          <button onClick={onShowConfig}
+            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg shadow font-bold text-sm">
+            ⚙️ 집계 설정
+          </button>
+          <button onClick={onReset}
+            className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg font-medium text-sm">
+            🔄 다시 업로드
+          </button>
+        </div>
+      </div>
+      <div className="flex gap-1 border-b border-gray-200">
+        <button onClick={() => setTab('main')}
+          className={`px-6 py-3 font-bold transition ${tab === 'main' ? 'border-b-2 border-emerald-600 text-emerald-700 bg-emerald-50' : 'text-gray-500 hover:text-gray-700'}`}>
+          📊 FTFR 메인
+        </button>
+        <button onClick={() => setTab('detail')}
+          className={`px-6 py-3 font-bold transition ${tab === 'detail' ? 'border-b-2 border-emerald-600 text-emerald-700 bg-emerald-50' : 'text-gray-500 hover:text-gray-700'}`}>
+          📋 FTFR 세부
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─────────── KPI 카드 ───────────
+function KpiCards({ activeProcesses, processStats, year }) {
+  const totals = useMemo(() => {
+    let good = 0, defect = 0, rework = 0;
+    activeProcesses.forEach(p => {
+      const s = processStats[p];
+      if (!s) return;
+      good += sumArr(s.good); defect += sumArr(s.defect); rework += sumArr(s.rework);
+    });
+    const input = good + defect;
+    const ftfr = input > 0 ? (rework / input) * 1000000 : 0;
+    return { good, defect, rework, input, ftfr };
+  }, [activeProcesses, processStats]);
+  
+  const Card = ({ label, value, sub, color, big }) => (
+    <div className={`bg-white rounded-xl shadow p-5 border-l-4 ${color}`}>
+      <div className="text-xs font-bold text-gray-500 tracking-wider">{label}</div>
+      <div className={`font-bold text-gray-800 mt-1 tabular-nums ${big ? 'text-3xl' : 'text-2xl'}`}>{value}</div>
+      {sub && <div className="text-xs text-gray-400 mt-0.5">{sub}</div>}
+    </div>
+  );
+  
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+      <Card label="공정 수" value={activeProcesses.length} sub={`${year}년 활성`} color="border-blue-500" />
+      <Card label="완제품 (양품)" value={fmtNum(totals.good)} color="border-gray-400" />
+      <Card label="2차불량 (NG)" value={fmtNum(totals.defect)} color="border-red-500" />
+      <Card label="1차불량 (재작업)" value={fmtNum(totals.rework)} color="border-amber-500" />
+      <Card label="전체 FTFR" value={fmtPct(totals.ftfr)} sub={`재작업 ÷ ${fmtNum(totals.input)}`} color="border-emerald-500" big />
+    </div>
+  );
+}
+
+// ─────────── 월별 추이 차트 ───────────
+function MonthlyTrendChart({ activeProcesses, processStats }) {
+  const monthly = useMemo(() => {
+    const arr = MONTHS.map(() => ({ good: 0, defect: 0, rework: 0 }));
+    activeProcesses.forEach(p => {
+      const s = processStats[p];
+      if (!s) return;
+      for (let i = 0; i < 12; i++) {
+        arr[i].good += s.good[i];
+        arr[i].defect += s.defect[i];
+        arr[i].rework += s.rework[i];
+      }
+    });
+    return arr.map(m => {
+      const input = m.good + m.defect;
+      return { ...m, input, ftfr: input > 0 ? (m.rework / input) * 1000000 : null };
+    });
+  }, [activeProcesses, processStats]);
+  
+  const maxQty = Math.max(1, ...monthly.flatMap(m => [m.defect, m.rework]));
+  const ftfrVals = monthly.filter(m => m.ftfr !== null).map(m => m.ftfr);
+  const maxFtfr = Math.max(0.1, ...ftfrVals) * 1.15;
+  
+  const W = 1200, H = 320, PAD_L = 70, PAD_R = 70, PAD_T = 30, PAD_B = 50;
+  const CW = W - PAD_L - PAD_R, CH = H - PAD_T - PAD_B;
+  const monW = CW / 12;
+  const barW = monW * 0.32;
+  
+  const yPct = (v) => PAD_T + CH - (v / maxFtfr) * CH;
+  const ftfrPoints = monthly.map((m, i) => {
+    if (m.ftfr === null) return null;
+    return { x: PAD_L + monW * i + monW / 2, y: yPct(m.ftfr), v: m.ftfr };
+  }).filter(p => p);
+  const linePath = ftfrPoints.length ? 'M' + ftfrPoints.map(p => `${p.x},${p.y}`).join(' L ') : '';
+  
+  return (
+    <div className="bg-white rounded-xl shadow p-5 mb-6">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-lg font-bold text-gray-800">월별 추이</h3>
+        <div className="flex gap-4 text-xs">
+          <span className="flex items-center gap-1"><span className="w-3 h-3 bg-amber-500 rounded-sm inline-block"></span>1차불량(재작업)</span>
+          <span className="flex items-center gap-1"><span className="w-3 h-3 bg-red-500 rounded-sm inline-block"></span>2차불량</span>
+          <span className="flex items-center gap-1"><span className="w-4 h-0.5 bg-emerald-600 inline-block"></span>FTFR(ppm)</span>
+        </div>
+      </div>
+      <div className="overflow-x-auto">
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ minWidth: 700 }}>
+          {[0, 0.25, 0.5, 0.75, 1].map((r, i) => (
+            <g key={`gy${i}`}>
+              <line x1={PAD_L} y1={PAD_T + CH * (1 - r)} x2={W - PAD_R} y2={PAD_T + CH * (1 - r)}
+                stroke="#e5e7eb" strokeDasharray="3 3" />
+              <text x={PAD_L - 8} y={PAD_T + CH * (1 - r) + 4} fontSize="10" textAnchor="end" fill="#6b7280">
+                {fmtNum(maxQty * r)}
+              </text>
+              <text x={W - PAD_R + 8} y={PAD_T + CH * (1 - r) + 4} fontSize="10" textAnchor="start" fill="#059669">
+                {fmtNum(maxFtfr * r)}
+              </text>
+            </g>
+          ))}
+          {monthly.map((m, i) => {
+            const cx = PAD_L + monW * i + monW / 2;
+            const reworkH = (m.rework / maxQty) * CH;
+            const defectH = (m.defect / maxQty) * CH;
+            return (
+              <g key={i}>
+                <rect x={cx - barW - 1} y={PAD_T + CH - reworkH} width={barW} height={reworkH} fill="#f59e0b" />
+                <rect x={cx + 1} y={PAD_T + CH - defectH} width={barW} height={defectH} fill="#ef4444" />
+                <text x={cx} y={PAD_T + CH + 18} fontSize="11" textAnchor="middle" fill="#374151" fontWeight="500">{MONTHS[i]}</text>
+              </g>
+            );
+          })}
+          {linePath && <path d={linePath} stroke="#059669" strokeWidth="2.5" fill="none" />}
+          {ftfrPoints.map((p, i) => (
+            <g key={i}>
+              <circle cx={p.x} cy={p.y} r="4" fill="#fff" stroke="#059669" strokeWidth="2" />
+              <text x={p.x} y={p.y - 8} fontSize="10" textAnchor="middle" fill="#047857" fontWeight="bold">
+                {fmtNum(p.v)}
+              </text>
+            </g>
+          ))}
+          <line x1={PAD_L} y1={PAD_T} x2={PAD_L} y2={PAD_T + CH} stroke="#374151" />
+          <line x1={PAD_L} y1={PAD_T + CH} x2={W - PAD_R} y2={PAD_T + CH} stroke="#374151" />
+          <line x1={W - PAD_R} y1={PAD_T} x2={W - PAD_R} y2={PAD_T + CH} stroke="#059669" strokeWidth="1" opacity="0.5" />
+        </svg>
+      </div>
+    </div>
+  );
+}
+
+// ─────────── 라인(New) 그룹별 공정 표 ───────────
+function GroupSummaryTable({ activeProcesses, processStats, processInfo, lineFilter }) {
+  const groups = useMemo(() => {
+    const showGroups = lineFilter === 'all' ? LINE_GROUPS : [lineFilter];
+    return showGroups.map(g => {
+      const procs = activeProcesses.filter(p => processInfo[p]?.line === g);
+      const rows = procs.map(p => {
+        const s = processStats[p];
+        const good = sumArr(s.good), defect = sumArr(s.defect), rework = sumArr(s.rework);
+        const input = good + defect;
+        const ftfr = input > 0 ? (rework / input) * 1000000 : null;
+        return { process: p, good, defect, rework, input, ftfr };
+      }).sort((a, b) => b.input - a.input);
+      const total = rows.reduce((acc, r) => ({
+        good: acc.good + r.good, defect: acc.defect + r.defect,
+        rework: acc.rework + r.rework, input: acc.input + r.input
+      }), { good: 0, defect: 0, rework: 0, input: 0 });
+      total.ftfr = total.input > 0 ? (total.rework / total.input) * 1000000 : null;
+      return { group: g, rows, total };
+    }).filter(g => g.rows.length > 0);
+  }, [activeProcesses, processStats, processInfo, lineFilter]);
+  
+  return (
+    <div className="space-y-6 mb-6">
+      {groups.map(g => (
+        <div key={g.group} className="bg-white rounded-xl shadow overflow-hidden">
+          <div className={`px-5 py-3 text-white flex items-center justify-between ${g.group === 'TCP' ? 'bg-gradient-to-r from-blue-700 to-cyan-600' : 'bg-gradient-to-r from-purple-700 to-pink-600'}`}>
+            <h2 className="text-xl font-bold tracking-wide">{g.group}</h2>
+            <div className="text-sm">
+              FTFR: <span className="text-2xl font-bold ml-2">{fmtPct(g.total.ftfr)}</span>
+              <span className="ml-3 opacity-80">·  {g.rows.length}개 공정</span>
+            </div>
+          </div>
+          <table className="min-w-full text-sm">
+            <thead className="bg-gray-50 border-b">
+              <tr>
+                <th className="px-4 py-2.5 text-left font-bold text-gray-700">공정(New)</th>
+                <th className="px-4 py-2.5 text-right font-bold text-gray-700">완제품</th>
+                <th className="px-4 py-2.5 text-right font-bold text-gray-700">2차불량</th>
+                <th className="px-4 py-2.5 text-right font-bold text-gray-700">1차불량</th>
+                <th className="px-4 py-2.5 text-right font-bold text-gray-700">투입수량</th>
+                <th className="px-4 py-2.5 text-right font-bold text-gray-700">FTFR(ppm)</th>
+                <th className="px-4 py-2.5 w-32"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {g.rows.map(r => {
+                const ftfrColor = r.ftfr === null ? 'text-gray-400' :
+                  r.ftfr < 10000 ? 'text-emerald-700' : r.ftfr < 30000 ? 'text-amber-700' : 'text-red-700';
+                const barW = g.total.input > 0 ? (r.input / g.total.input) * 100 : 0;
+                return (
+                  <tr key={r.process} className="hover:bg-gray-50">
+                    <td className="px-4 py-2 font-bold text-gray-800">{r.process}</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{fmtNum(r.good)}</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{fmtNum(r.defect)}</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{fmtNum(r.rework)}</td>
+                    <td className="px-4 py-2 text-right tabular-nums font-medium">{fmtNum(r.input)}</td>
+                    <td className={`px-4 py-2 text-right tabular-nums font-bold ${ftfrColor}`}>{fmtPct(r.ftfr)}</td>
+                    <td className="px-2 py-2">
+                      <div className="bg-gray-100 rounded-full h-2 overflow-hidden">
+                        <div className={`h-full ${g.group === 'TCP' ? 'bg-cyan-500' : 'bg-pink-500'}`} style={{ width: `${barW}%` }} />
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+            <tfoot>
+              <tr className="bg-gray-100 font-bold">
+                <td className="px-4 py-2.5 text-gray-800">합계</td>
+                <td className="px-4 py-2.5 text-right tabular-nums">{fmtNum(g.total.good)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums">{fmtNum(g.total.defect)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums">{fmtNum(g.total.rework)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums">{fmtNum(g.total.input)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums text-emerald-700">{fmtPct(g.total.ftfr)}</td>
+                <td></td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─────────── Top/Bottom Part ───────────
+function TopBottomCard({ data, year, activeProcesses, isIncluded }) {
+  const [minInput, setMinInput] = useState(100); // 최소 투입수량 필터
+  
+  const ranked = useMemo(() => {
+    if (!data || !year) return [];
+    const m = {};
+    const key = (r) => `${r.process}|${r.part || '(미분류)'}`;
+    
+    data.good.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!activeProcesses.includes(r.process)) return;
+      const k = key(r);
+      if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
+      m[k].good += r.qty;
+    });
+    data.defect.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!activeProcesses.includes(r.process)) return;
+      if (!isIncluded(r.process, r.station, r.type, 'defect')) return;
+      const k = key(r);
+      if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
+      m[k].defect += r.qty;
+    });
+    data.rework.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!activeProcesses.includes(r.process)) return;
+      if (!isIncluded(r.process, r.station, r.type, 'rework')) return;
+      const k = key(r);
+      if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
+      m[k].rework += r.qty;
+    });
+    
+    return Object.values(m).map(s => {
+      const input = s.good + s.defect;
+      const ftfr = input > 0 ? (s.rework / input) * 1000000 : null;
+      return { ...s, input, ftfr };
+    }).filter(r => r.ftfr !== null && r.input >= minInput).sort((a, b) => a.ftfr - b.ftfr);
+  }, [data, year, activeProcesses, isIncluded, minInput]);
+  
+  const top5 = ranked.slice(0, 5);
+  const bottom5 = ranked.slice(-5).reverse();
+  
+  const Row = ({ r, idx, good }) => (
+    <div className="flex items-center justify-between py-1.5 px-3 hover:bg-gray-50 rounded">
+      <div className="flex items-center gap-3 min-w-0">
+        <span className={`w-6 h-6 shrink-0 rounded-full text-xs font-bold flex items-center justify-center ${good ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>{idx + 1}</span>
+        <div className="min-w-0">
+          <div className="font-bold text-gray-800 text-sm truncate" title={r.part}>{r.part}</div>
+          <div className="text-xs text-gray-400 truncate">{r.line} · {r.process} · 투입 {fmtNum(r.input)}</div>
+        </div>
+      </div>
+      <div className={`font-bold tabular-nums ml-2 ${good ? 'text-emerald-700' : 'text-red-700'}`}>{fmtPct(r.ftfr)}</div>
+    </div>
+  );
+  
+  return (
+    <div className="mb-6">
+      <div className="flex items-center justify-end mb-2 gap-2 text-xs text-gray-600">
+        <span>최소 투입수량:</span>
+        <div className="flex gap-1 bg-white border rounded p-0.5">
+          {[0, 100, 1000, 10000].map(v => (
+            <button key={v} onClick={() => setMinInput(v)}
+              className={`px-2 py-0.5 rounded font-bold ${minInput === v ? 'bg-emerald-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>
+              {v === 0 ? '전체' : fmtNum(v) + '+'}
+            </button>
+          ))}
+        </div>
+        <span className="text-gray-400">· {ranked.length}개 Part</span>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="bg-white rounded-xl shadow p-5">
+          <h3 className="text-base font-bold text-emerald-700 mb-3 flex items-center gap-2">
+            <span className="text-xl">🏆</span> Top 5 Part (FTFR 낮음 = 우수)
+          </h3>
+          {top5.length > 0 ? top5.map((r, i) => <Row key={`${r.process}|${r.part}`} r={r} idx={i} good />) : <div className="text-sm text-gray-400">데이터 없음</div>}
+        </div>
+        <div className="bg-white rounded-xl shadow p-5">
+          <h3 className="text-base font-bold text-red-700 mb-3 flex items-center gap-2">
+            <span className="text-xl">⚠️</span> Bottom 5 Part (FTFR 높음 = 개선 필요)
+          </h3>
+          {bottom5.length > 0 ? bottom5.map((r, i) => <Row key={`${r.process}|${r.part}`} r={r} idx={i} />) : <div className="text-sm text-gray-400">데이터 없음</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────── MAIN TAB ───────────
+function MainTab({ year, data, activeProcesses, processStats, processInfo, isIncluded, lineFilter }) {
+  if (activeProcesses.length === 0) {
+    return (
+      <div className="bg-white rounded-xl shadow p-12 text-center text-gray-500">
+        <div className="text-4xl mb-2">📭</div>
+        <div className="text-lg">{year}년 / {lineFilter === 'all' ? '전체' : lineFilter} 데이터가 없습니다.</div>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <KpiCards activeProcesses={activeProcesses} processStats={processStats} year={year} />
+      <MonthlyTrendChart activeProcesses={activeProcesses} processStats={processStats} />
+      <GroupSummaryTable activeProcesses={activeProcesses} processStats={processStats} processInfo={processInfo} lineFilter={lineFilter} />
+      <TopBottomCard data={data} year={year} activeProcesses={activeProcesses} isIncluded={isIncluded} />
+    </div>
+  );
+}
+
+// ─────────── 공정별 월간 표 ───────────
+function ProcessMonthlyTable({ process, line, stats }) {
+  if (!stats) return null;
+  const { good, defect, rework } = stats;
+  const input = good.map((g, i) => g + defect[i]);
+  const ftfr = rework.map((r, i) => input[i] > 0 ? (r / input[i]) * 1000000 : null);
+  const goodYTD = sumArr(good), defectYTD = sumArr(defect), reworkYTD = sumArr(rework);
+  const inputYTD = goodYTD + defectYTD;
+  const ftfrYTD = inputYTD > 0 ? (reworkYTD / inputYTD) * 1000000 : null;
+  const headerColor = line === 'TCP' ? 'from-blue-700 to-cyan-600' : 'from-purple-700 to-pink-600';
+  
+  return (
+    <div className="bg-white rounded-xl shadow overflow-hidden">
+      <div className={`px-5 py-2.5 bg-gradient-to-r ${headerColor} text-white flex items-center justify-between`}>
+        <h3 className="text-lg font-bold tracking-wide">
+          <span className="opacity-70 text-sm mr-2">{line}</span>{process}
+        </h3>
+        <div className="text-sm">
+          FTFR: <span className="text-xl font-bold ml-2">{fmtPct(ftfrYTD)}</span>
+        </div>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="min-w-full text-xs">
+          <thead className="bg-gray-50 border-b-2">
+            <tr>
+              <th colSpan="2" className="px-3 py-2 text-left font-medium text-gray-700 w-64"></th>
+              {MONTHS.map(m => <th key={m} className="px-2 py-2 text-right font-medium text-gray-700 w-16">{m}</th>)}
+              <th className="px-3 py-2 text-right font-bold text-gray-900 border-l-2 border-gray-300 w-20">YTD</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            <tr>
+              <td className="px-3 py-2 text-[10px] text-gray-500 whitespace-nowrap pl-4">1차불량 / 재작업</td>
+              <td className="px-3 py-2 font-bold text-gray-700 whitespace-nowrap">1차불량</td>
+              {rework.map((v, i) => <td key={i} className="px-2 py-2 text-right tabular-nums">{v > 0 ? fmtNum(v) : '-'}</td>)}
+              <td className="px-3 py-2 text-right font-bold tabular-nums border-l-2 border-gray-300">{fmtNum(reworkYTD)}</td>
+            </tr>
+            <tr>
+              <td className="px-3 py-2 text-[10px] text-gray-500 whitespace-nowrap pl-4">2차불량 / scrap</td>
+              <td className="px-3 py-2 font-bold text-gray-700 whitespace-nowrap">2차불량</td>
+              {defect.map((v, i) => <td key={i} className="px-2 py-2 text-right tabular-nums">{v > 0 ? fmtNum(v) : '-'}</td>)}
+              <td className="px-3 py-2 text-right font-bold tabular-nums border-l-2 border-gray-300">{fmtNum(defectYTD)}</td>
+            </tr>
+            <tr className="bg-gray-100">
+              <td className="px-3 py-2 text-[10px] text-gray-500 whitespace-nowrap pl-4">완제품 / 양품</td>
+              <td className="px-3 py-2 font-bold text-gray-700 whitespace-nowrap">완제품수량</td>
+              {good.map((v, i) => <td key={i} className="px-2 py-2 text-right tabular-nums">{v > 0 ? fmtNum(v) : '-'}</td>)}
+              <td className="px-3 py-2 text-right font-bold tabular-nums border-l-2 border-gray-300">{fmtNum(goodYTD)}</td>
+            </tr>
+            <tr>
+              <td className="px-3 py-2 text-[10px] text-gray-500 whitespace-nowrap pl-4">총수량 = 양품+불량</td>
+              <td className="px-3 py-2 font-bold text-gray-700 whitespace-nowrap">투입수량</td>
+              {input.map((v, i) => <td key={i} className="px-2 py-2 text-right tabular-nums">{v > 0 ? fmtNum(v) : '-'}</td>)}
+              <td className="px-3 py-2 text-right font-bold tabular-nums border-l-2 border-gray-300">{fmtNum(inputYTD)}</td>
+            </tr>
+            <tr className="bg-emerald-50 border-t-2 border-emerald-200">
+              <td className="px-3 py-2 text-[10px] text-emerald-600 whitespace-nowrap pl-4">First Time Final Rate</td>
+              <td className="px-3 py-2 font-bold text-emerald-800 whitespace-nowrap">FTFR</td>
+              {ftfr.map((v, i) => (
+                <td key={i} className="px-2 py-2 text-right tabular-nums text-emerald-700 font-medium">{v !== null ? fmtPct(v) : '-'}</td>
+              ))}
+              <td className="px-3 py-2 text-right font-bold text-emerald-800 tabular-nums border-l-2 border-emerald-300">
+                {ftfrYTD !== null ? fmtPct(ftfrYTD) : '-'}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─────────── Part별 표 (행 확장 + 유형별 분석) ───────────
+function PartTable({ data, year, process, processInfo, isIncluded }) {
+  const [expandedParts, setExpandedParts] = useState(new Set());
+  
+  const partStats = useMemo(() => {
+    if (!data || !year || !process) return [];
+    const parts = processInfo[process]?.parts || [];
+    const m = {};
+    parts.forEach(pt => {
+      m[pt] = { good: 0, defect: 0, rework: 0, defectTypes: {}, reworkTypes: {} };
+    });
+    data.good.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (r.process !== process || !m[r.part]) return;
+      m[r.part].good += r.qty;
+    });
+    data.defect.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (r.process !== process || !m[r.part]) return;
+      if (!isIncluded(r.process, r.station, r.type, 'defect')) return;
+      m[r.part].defect += r.qty;
+      const t = r.type || '(미분류)';
+      m[r.part].defectTypes[t] = (m[r.part].defectTypes[t] || 0) + r.qty;
+    });
+    data.rework.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (r.process !== process || !m[r.part]) return;
+      if (!isIncluded(r.process, r.station, r.type, 'rework')) return;
+      m[r.part].rework += r.qty;
+      const t = r.type || '(미분류)';
+      m[r.part].reworkTypes[t] = (m[r.part].reworkTypes[t] || 0) + r.qty;
+    });
+    return parts.map(pt => {
+      const s = m[pt];
+      const input = s.good + s.defect;
+      const ftfr = input > 0 ? (s.rework / input) * 1000000 : null;
+      const defectTypes = Object.entries(s.defectTypes).map(([type, qty]) => ({ type, qty })).sort((a, b) => b.qty - a.qty);
+      const reworkTypes = Object.entries(s.reworkTypes).map(([type, qty]) => ({ type, qty })).sort((a, b) => b.qty - a.qty);
+      return { part: pt, good: s.good, defect: s.defect, rework: s.rework, input, ftfr, defectTypes, reworkTypes };
+    }).filter(r => r.input > 0).sort((a, b) => b.input - a.input);
+  }, [data, year, process, processInfo, isIncluded]);
+  
+  // 공정 변경 시 펼침 상태 초기화
+  useEffect(() => { setExpandedParts(new Set()); }, [process]);
+  
+  const toggleExpand = (part) => {
+    setExpandedParts(prev => {
+      const next = new Set(prev);
+      if (next.has(part)) next.delete(part); else next.add(part);
+      return next;
+    });
+  };
+  const expandAll = () => setExpandedParts(new Set(partStats.map(r => r.part)));
+  const collapseAll = () => setExpandedParts(new Set());
+  
+  if (!process) return null;
+  
+  const TypeBox = ({ kind, types, total }) => {
+    const isRework = kind === 'rework';
+    const titleEmoji = isRework ? '🟡' : '🔴';
+    const titleText = isRework ? '1차불량 (재작업) 유형' : '2차불량 (불량) 유형';
+    const borderColor = isRework ? 'border-amber-200' : 'border-red-200';
+    const headerBg = isRework ? 'bg-amber-100 text-amber-800' : 'bg-red-100 text-red-800';
+    const barTrack = isRework ? 'bg-amber-100' : 'bg-red-100';
+    const barFill = isRework ? 'bg-amber-500' : 'bg-red-500';
+    const barText = isRework ? 'text-amber-700' : 'text-red-700';
+    const rowBorder = isRework ? 'border-amber-100' : 'border-red-100';
+    
+    return (
+      <div className={`bg-white rounded-lg shadow-sm overflow-hidden border ${borderColor}`}>
+        <div className={`px-3 py-1.5 ${headerBg} text-xs font-bold flex justify-between items-center`}>
+          <span>{titleEmoji} {titleText} — {types.length}종</span>
+          <span className="tabular-nums">합계 {fmtNum(total)}</span>
+        </div>
+        {types.length === 0 ? (
+          <div className="p-3 text-xs text-gray-400 text-center">데이터 없음</div>
+        ) : (
+          <table className="w-full text-xs">
+            <tbody>
+              {types.map(t => {
+                const ratio = total > 0 ? (t.qty / total) * 100 : 0;
+                return (
+                  <tr key={t.type} className={`border-t ${rowBorder}`}>
+                    <td className="px-3 py-1 text-gray-700 truncate max-w-[200px]" title={t.type}>{t.type}</td>
+                    <td className="px-3 py-1 text-right tabular-nums font-medium w-20">{fmtNum(t.qty)}</td>
+                    <td className="px-3 py-1 w-32">
+                      <div className="flex items-center gap-1.5">
+                        <div className={`flex-1 ${barTrack} rounded h-1.5 overflow-hidden`}>
+                          <div className={`h-full ${barFill}`} style={{width: `${ratio}%`}} />
+                        </div>
+                        <span className={`text-[10px] ${barText} w-10 text-right tabular-nums`}>{ratio.toFixed(1)}%</span>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    );
+  };
+  
+  return (
+    <div className="bg-white rounded-xl shadow overflow-hidden mt-4">
+      <div className="px-5 py-2.5 bg-slate-700 text-white flex items-center justify-between">
+        <h3 className="text-base font-bold">{process} · Part별 분석 ({partStats.length}개)</h3>
+        {partStats.length > 0 && (
+          <div className="flex gap-2">
+            <button onClick={expandAll} className="text-xs px-2.5 py-1 bg-white bg-opacity-20 hover:bg-opacity-30 rounded font-medium">모두 펼치기</button>
+            <button onClick={collapseAll} className="text-xs px-2.5 py-1 bg-white bg-opacity-20 hover:bg-opacity-30 rounded font-medium">모두 접기</button>
+          </div>
+        )}
+      </div>
+      {partStats.length === 0 ? (
+        <div className="p-8 text-center text-gray-400">데이터 없음</div>
+      ) : (
+        <table className="min-w-full text-sm">
+          <thead className="bg-gray-50 border-b">
+            <tr>
+              <th className="w-10 px-2 py-2"></th>
+              <th className="px-4 py-2 text-left font-bold text-gray-700">Part</th>
+              <th className="px-4 py-2 text-right font-bold text-gray-700">완제품</th>
+              <th className="px-4 py-2 text-right font-bold text-gray-700">2차불량</th>
+              <th className="px-4 py-2 text-right font-bold text-gray-700">1차불량</th>
+              <th className="px-4 py-2 text-right font-bold text-gray-700">투입수량</th>
+              <th className="px-4 py-2 text-right font-bold text-gray-700">FTFR(ppm)</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {partStats.map(r => {
+              const expanded = expandedParts.has(r.part);
+              const ftfrColor = r.ftfr === null ? 'text-gray-400' :
+                r.ftfr < 10000 ? 'text-emerald-700' : r.ftfr < 30000 ? 'text-amber-700' : 'text-red-700';
+              return (
+                <React.Fragment key={r.part}>
+                  <tr className="hover:bg-emerald-50/50 cursor-pointer transition" onClick={() => toggleExpand(r.part)}>
+                    <td className="px-2 py-2 text-center">
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); toggleExpand(r.part); }}
+                        className={`w-6 h-6 rounded border font-bold leading-none transition ${expanded ? 'bg-emerald-600 border-emerald-700 text-white' : 'bg-white border-gray-300 text-gray-600 hover:bg-emerald-50 hover:text-emerald-700 hover:border-emerald-400'}`}>
+                        {expanded ? '−' : '+'}
+                      </button>
+                    </td>
+                    <td className="px-4 py-2 font-medium text-gray-800">{r.part || '(미분류)'}</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{fmtNum(r.good)}</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{fmtNum(r.defect)}</td>
+                    <td className="px-4 py-2 text-right tabular-nums">{fmtNum(r.rework)}</td>
+                    <td className="px-4 py-2 text-right tabular-nums font-medium">{fmtNum(r.input)}</td>
+                    <td className={`px-4 py-2 text-right tabular-nums font-bold ${ftfrColor}`}>{fmtPct(r.ftfr)}</td>
+                  </tr>
+                  {expanded && (
+                    <tr className="bg-gray-50">
+                      <td></td>
+                      <td colSpan={6} className="px-4 py-3">
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                          <TypeBox kind="rework" types={r.reworkTypes} total={r.rework} />
+                          <TypeBox kind="defect" types={r.defectTypes} total={r.defect} />
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+// ─────────── 월별 유형별 집계 표 ───────────
+function MonthlyTypeTable({ data, year, activeProcesses, isIncluded }) {
+  const buildTable = useCallback((rows, kind) => {
+    const m = {};
+    rows.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!activeProcesses.includes(r.process)) return;
+      if (!isIncluded(r.process, r.station, r.type, kind)) return;
+      const t = r.type || '(미분류)';
+      if (!m[t]) m[t] = Array(12).fill(0);
+      m[t][r.date.getMonth()] += r.qty;
+    });
+    return Object.entries(m).map(([t, arr]) => ({
+      type: t, monthly: arr, total: sumArr(arr)
+    })).sort((a, b) => b.total - a.total);
+  }, [year, activeProcesses, isIncluded]);
+  
+  const defectRows = useMemo(() => buildTable(data.defect, 'defect'), [data.defect, buildTable]);
+  const reworkRows = useMemo(() => buildTable(data.rework, 'rework'), [data.rework, buildTable]);
+  
+  const Table = ({ title, rows, colorClass, accentRgb }) => {
+    const colTotals = MONTHS.map((_, i) => rows.reduce((sum, r) => sum + r.monthly[i], 0));
+    const grandTotal = rows.reduce((sum, r) => sum + r.total, 0);
+    const max = Math.max(1, ...rows.flatMap(r => r.monthly));
+    return (
+      <div className="bg-white rounded-xl shadow overflow-hidden">
+        <div className={`px-5 py-2.5 ${colorClass} text-white flex items-center justify-between`}>
+          <h3 className="text-base font-bold">{title} ({rows.length}개 유형)</h3>
+          <div className="text-sm">합계: <span className="font-bold tabular-nums">{fmtNum(grandTotal)}</span></div>
+        </div>
+        <div className="overflow-x-auto max-h-[600px]">
+          <table className="min-w-full text-xs">
+            <thead className="bg-gray-50 border-b-2 sticky top-0 z-10">
+              <tr>
+                <th className="px-3 py-2 text-left font-bold text-gray-700 sticky left-0 bg-gray-50">유형</th>
+                {MONTHS.map(m => <th key={m} className="px-2 py-2 text-right font-bold text-gray-700 w-14">{m}</th>)}
+                <th className="px-3 py-2 text-right font-bold text-gray-900 border-l-2 border-gray-300 w-20">YTD</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {rows.map(r => (
+                <tr key={r.type} className="hover:bg-gray-50">
+                  <td className="px-3 py-1.5 font-medium text-gray-800 whitespace-nowrap sticky left-0 bg-white max-w-[200px] truncate" title={r.type}>{r.type}</td>
+                  {r.monthly.map((v, i) => {
+                    const intensity = v > 0 ? Math.min(1, v / max) : 0;
+                    const bg = intensity > 0 ? `rgba(${accentRgb},${intensity * 0.25})` : '';
+                    return <td key={i} className="px-2 py-1.5 text-right tabular-nums" style={{ background: bg }}>{v > 0 ? fmtNum(v) : ''}</td>;
+                  })}
+                  <td className="px-3 py-1.5 text-right font-bold tabular-nums border-l-2 border-gray-300">{fmtNum(r.total)}</td>
+                </tr>
+              ))}
+              {rows.length === 0 && (
+                <tr><td colSpan={14} className="text-center text-gray-400 py-6">데이터 없음</td></tr>
+              )}
+            </tbody>
+            {rows.length > 0 && (
+              <tfoot>
+                <tr className="bg-gray-100 font-bold">
+                  <td className="px-3 py-2 sticky left-0 bg-gray-100">월별 합계</td>
+                  {colTotals.map((v, i) => <td key={i} className="px-2 py-2 text-right tabular-nums">{v > 0 ? fmtNum(v) : '-'}</td>)}
+                  <td className="px-3 py-2 text-right tabular-nums border-l-2 border-gray-300">{fmtNum(grandTotal)}</td>
+                </tr>
+              </tfoot>
+            )}
+          </table>
+        </div>
+      </div>
+    );
+  };
+  
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+      <Table title="🟡 1차불량 (재작업) 월별" rows={reworkRows} colorClass="bg-amber-700" accentRgb="245,158,11" />
+      <Table title="🔴 2차불량 (불량) 월별" rows={defectRows} colorClass="bg-red-700" accentRgb="239,68,68" />
+    </div>
+  );
+}
+
+// ─────────── DETAIL TAB ───────────
+function DetailTab({ data, year, activeProcesses, processStats, processInfo, isIncluded, lineFilter }) {
+  const [selectedPart, setSelectedPart] = useState(null);
+  
+  if (activeProcesses.length === 0) {
+    return (
+      <div className="bg-white rounded-xl shadow p-12 text-center text-gray-500">
+        <div className="text-4xl mb-2">📭</div>
+        <div className="text-lg">{year}년 / {lineFilter === 'all' ? '전체' : lineFilter} 데이터가 없습니다.</div>
+      </div>
+    );
+  }
+  
+  return (
+    <div className="space-y-6">
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-xl font-bold text-gray-800">📅 공정별 월간 표 ({activeProcesses.length}개)</h2>
+        </div>
+        <div className="space-y-4">
+          {activeProcesses.map(p => (
+            <ProcessMonthlyTable key={p} process={p} line={processStats[p]?.line} stats={processStats[p]} />
+          ))}
+        </div>
+      </div>
+      
+      <div>
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <h2 className="text-xl font-bold text-gray-800">🔍 Part별 분석</h2>
+          <select value={selectedPart || ''} onChange={(e) => setSelectedPart(e.target.value || null)}
+            className="px-3 py-2 border rounded-lg shadow-sm font-medium bg-white">
+            <option value="">공정 선택...</option>
+            {activeProcesses.map(p => (
+              <option key={p} value={p}>{processStats[p]?.line} · {p}</option>
+            ))}
+          </select>
+        </div>
+        {selectedPart ? (
+          <PartTable data={data} year={year} process={selectedPart} processInfo={processInfo} isIncluded={isIncluded} />
+        ) : (
+          <div className="bg-white rounded-xl shadow p-8 text-center text-gray-400">
+            👆 위에서 공정을 선택하면 Part별 데이터가 표시됩니다.
+          </div>
+        )}
+      </div>
+      
+      <div>
+        <h2 className="text-xl font-bold text-gray-800 mb-3">📊 유형별 월별 집계표</h2>
+        <MonthlyTypeTable data={data} year={year} activeProcesses={activeProcesses} isIncluded={isIncluded} />
+      </div>
+    </div>
+  );
+}
+
+// ─────────── CONFIG MODAL ───────────
+function ConfigModal({ processes, processInfo, config, onChange, onClose }) {
+  const [local, setLocal] = useState(config);
+  
+  const update = (next) => { setLocal(next); onChange(next); };
+  
+  const toggle = (process, kind, value) => {
+    const cur = (local[process] && local[process][kind]) || [];
+    const next = cur.includes(value) ? cur.filter(x => x !== value) : [...cur, value];
+    update({ ...local, [process]: { ...(local[process] || {}), [kind]: next } });
+  };
+  const selectAll = (process, kind) => {
+    const all = processInfo[process]?.[kind] || [];
+    update({ ...local, [process]: { ...(local[process] || {}), [kind]: [...all] } });
+  };
+  const clearKind = (process, kind) => {
+    update({ ...local, [process]: { ...(local[process] || {}), [kind]: [] } });
+  };
+  const reset = () => update({});
+  
+  const grouped = useMemo(() => {
+    const g = { TCP: [], FE: [], Other: [] };
+    processes.forEach(p => {
+      const ln = processInfo[p]?.line || 'Other';
+      (g[ln] || g.Other).push(p);
+    });
+    return g;
+  }, [processes, processInfo]);
+  
+  const Column = ({ items, kind, label, accentClass, process }) => {
+    const sel = (local[process] && local[process][kind]) || [];
+    return (
+      <div className="border rounded p-2 bg-white min-h-[120px]">
+        <div className={`flex items-center justify-between mb-2 pb-1 border-b ${accentClass}`}>
+          <span className="text-xs font-bold">{label} ({items.length})</span>
+          <div className="flex gap-1">
+            <button onClick={() => selectAll(process, kind)}
+              className="text-[10px] px-1.5 py-0.5 bg-blue-50 text-blue-700 hover:bg-blue-100 rounded">전체</button>
+            <button onClick={() => clearKind(process, kind)}
+              className="text-[10px] px-1.5 py-0.5 bg-gray-100 text-gray-600 hover:bg-gray-200 rounded">해제</button>
+          </div>
+        </div>
+        <div className="space-y-0.5 max-h-40 overflow-y-auto">
+          {items.length === 0 ? (
+            <div className="text-[10px] text-gray-400 italic">없음</div>
+          ) : items.map(item => (
+            <label key={item} className="flex items-center gap-1.5 cursor-pointer hover:bg-gray-50 px-1 rounded">
+              <input type="checkbox" 
+                checked={sel.includes(item)} 
+                onChange={() => toggle(process, kind, item)}
+                className="w-3.5 h-3.5" />
+              <span className="text-[11px] text-gray-700 truncate" title={item}>{item}</span>
+            </label>
+          ))}
+        </div>
+        {items.length > 0 && (
+          sel.length === 0 
+            ? <div className="mt-1 text-[10px] text-amber-700">⚠ 미선택 = 전체 포함</div>
+            : <div className="mt-1 text-[10px] text-blue-700">✓ {sel.length} / {items.length}</div>
+        )}
+      </div>
+    );
+  };
+  
+  const Section = ({ title, list, headerColor }) => {
+    if (list.length === 0) return null;
+    return (
+      <div className="mb-6">
+        <h3 className={`text-base font-bold ${headerColor} mb-3 px-3 py-2 rounded-lg`}>{title} ({list.length}개)</h3>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+          {list.map(process => {
+            const info = processInfo[process];
+            return (
+              <div key={process} className="border rounded-lg p-3 bg-gray-50">
+                <div className="font-bold text-gray-800 mb-2 flex items-center gap-2">
+                  <span className="text-xs px-2 py-0.5 bg-gray-700 text-white rounded">{info?.line}</span>
+                  <span>{process}</span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                  <Column items={info?.stations || []} kind="stations" label="Station" accentClass="text-gray-700" process={process} />
+                  <Column items={info?.defectTypes || []} kind="defectTypes" label="2차불량 유형" accentClass="text-red-700" process={process} />
+                  <Column items={info?.reworkTypes || []} kind="reworkTypes" label="1차불량 유형" accentClass="text-amber-700" process={process} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+  
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-xl shadow-2xl max-w-7xl w-full max-h-[92vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="p-5 bg-gradient-to-r from-emerald-600 to-teal-600 text-white rounded-t-xl flex items-center justify-between">
+          <div>
+            <h2 className="text-2xl font-bold">⚙️ FTFR 집계 설정</h2>
+            <p className="text-sm text-emerald-100 mt-1">공정(New)별로 Station / 2차불량 유형 / 1차불량 유형 선택 (선택 없으면 전체 포함)</p>
+          </div>
+          <button onClick={onClose} className="text-3xl hover:bg-white hover:bg-opacity-20 rounded-lg w-10 h-10 flex items-center justify-center">×</button>
+        </div>
+        <div className="overflow-y-auto p-5 flex-1">
+          <Section title="🔵 TCP" list={grouped.TCP} headerColor="bg-blue-100 text-blue-800" />
+          <Section title="🟣 FE" list={grouped.FE} headerColor="bg-purple-100 text-purple-800" />
+          {grouped.Other.length > 0 && <Section title="기타" list={grouped.Other} headerColor="bg-gray-100 text-gray-800" />}
+        </div>
+        <div className="p-4 border-t bg-gray-50 rounded-b-xl flex justify-between items-center">
+          <button onClick={reset} className="px-4 py-2 bg-red-100 text-red-700 hover:bg-red-200 rounded-lg font-medium">🗑️ 전체 초기화</button>
+          <div className="text-xs text-gray-500">총 {processes.length}개 공정 · 변경 즉시 저장</div>
+          <button onClick={onClose} className="px-6 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold">완료</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
