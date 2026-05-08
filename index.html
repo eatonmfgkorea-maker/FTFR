@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>MFG FTFR 분석 V005</title>
+<title>MFG FTFR 분석 V009</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
@@ -22,28 +22,109 @@
 <script type="text/babel">
 const { useState, useEffect, useMemo, useCallback } = React;
 
-const STORAGE_KEY = 'mfg_ftfr_config_v2';
-const APP_VERSION = 'V005';
+const STORAGE_KEY = 'mfg_ftfr_config_v5';
+const APP_VERSION = 'V009';
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const LINE_GROUPS = ['TCP', 'FE'];
+
+// 사용자 분석본 기반 PRESET (공정(New)별 라인명/1차불량/2차불량 STATION)
+const PRESET_CONFIG = {
+  '1PC': {
+    lineNames: ['LD 1PC'],
+    reworkStations: [],
+    defectStations: []
+  },
+  '2PC': {
+    lineNames: ['ELD 2PC'],
+    reworkStations: ['Perfomance Test & Lot No Marking'],
+    defectStations: ["Case Ass'y& Back Parts Ass'y", 'Perfomance Test & Lot No Marking', 'Runout Gaging& Final Inspection']
+  },
+  'Nospin': {
+    lineNames: ['Nospin'],
+    reworkStations: [],
+    defectStations: []
+  },
+  'A/GVV': {
+    lineNames: ['AUTO GVV', 'Auto GVV'],
+    reworkStations: ['Final Test'],
+    defectStations: ['Final Test']
+  },
+  'A/FLVV': {
+    lineNames: ['Auto FLVV'],
+    reworkStations: ['Final Test'],
+    defectStations: ['Final Test']
+  },
+  'C/FLVV': {
+    lineNames: ['COMBO FLVV'],
+    reworkStations: ['Final Test'],
+    defectStations: ['Final Test', 'Sub Assembly']
+  },
+  'M/FLVV': {
+    lineNames: ['FLVV'],
+    reworkStations: ["Final Ass'y & Leak Test"],
+    defectStations: ["Final Ass'y & Leak Test"]
+  },
+  'M/GVV': {
+    lineNames: ['Manual GVV'],
+    reworkStations: ['FiNAl Test', 'Final Test'],
+    defectStations: ['Final Test']
+  },
+  'MEM': {
+    lineNames: ['MEMBRANE'],
+    reworkStations: ['Final Test'],
+    defectStations: ['Final Test']
+  },
+  'FTIV': {
+    lineNames: ['FTIV'],
+    reworkStations: ['Coil Resistance Test', 'Housing Leak Test', 'OPR Leak Test', 'OVR Leak Test', 'Pressure drop Test'],
+    defectStations: ['Coil Resistance Test', 'Housing Leak Test', 'OPR Leak Test', 'OVR Leak Test', 'Pressure drop Test']
+  },
+  'ICV': {
+    lineNames: ['ICV'],
+    reworkStations: ['Door 힘 검사', '저압 Leak'],
+    defectStations: ['Door 힘 검사', '저압 Leak']
+  },
+  'LVS': {
+    lineNames: ['LVS'],
+    reworkStations: ['Final Assembly', 'Final Test'],
+    defectStations: ['Final Assembly', 'Final Test']
+  },
+  'UCC': {
+    lineNames: ['UCC'],
+    reworkStations: ['EOL Test'],
+    defectStations: ['EOL Test']
+  }
+};
 
 const loadConfig = () => {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    return saved ? JSON.parse(saved) : {};
-  } catch { return {}; }
+    if (!saved) return JSON.parse(JSON.stringify(PRESET_CONFIG));
+    const parsed = JSON.parse(saved);
+    if (!parsed || Object.keys(parsed).length === 0) return JSON.parse(JSON.stringify(PRESET_CONFIG));
+    return parsed;
+  } catch { return JSON.parse(JSON.stringify(PRESET_CONFIG)); }
 };
 const saveConfig = (cfg) => {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); } catch {}
 };
 
 const parseDate = (v) => {
-  if (!v) return null;
-  if (v instanceof Date) return v;
-  if (typeof v === 'number') {
-    const d = new Date(Math.round((v - 25569) * 86400 * 1000));
-    return isNaN(d.getTime()) ? null : d;
+  // Excel 시리얼 → 한국 로컬 Date (timezone 영향 없음)
+  if (v === null || v === undefined || v === '') return null;
+  if (v instanceof Date) {
+    // 안전망: Date 객체 들어오면 그대로 (cellDates:false 라 일반적으로 안 들어옴)
+    return isNaN(v.getTime()) ? null : v;
   }
+  if (typeof v === 'number') {
+    // SheetJS의 SSF 파싱: Excel 시리얼 → {y, m, d, H, M, S} (시간대 무관)
+    try {
+      const p = XLSX.SSF.parse_date_code(v);
+      if (!p || !p.y) return null;
+      return new Date(p.y, p.m - 1, p.d);
+    } catch { return null; }
+  }
+  // 문자열 (드물게)
   const d = new Date(v);
   return isNaN(d.getTime()) ? null : d;
 };
@@ -70,7 +151,7 @@ function FileUpload({ onLoad }) {
     setLoading(true); setError('');
     try {
       const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: 'array', cellDates: true });
+      const wb = XLSX.read(buf, { type: 'array', cellDates: false });
       for (const s of ['양품', '불량', '재작업']) {
         if (!wb.SheetNames.includes(s)) {
           throw new Error(`'${s}' 시트가 없습니다. (있는 시트: ${wb.SheetNames.join(', ')})`);
@@ -83,6 +164,7 @@ function FileUpload({ onLoad }) {
       const normGood = good.map(r => ({
         date: parseDate(r['생산일자']),
         line: String(r['라인(New)'] || '').trim(),
+        lineName: String(r['라인명'] || '').trim(),
         process: String(r['공정(New)'] || '').trim(),
         part: String(r['Part'] || '').trim(),
         qty: Number(r['양품수량'] || 0)
@@ -91,6 +173,7 @@ function FileUpload({ onLoad }) {
       const normDef = defect.map(r => ({
         date: parseDate(r['일자']),
         line: String(r['라인(New)'] || '').trim(),
+        lineName: String(r['라인명'] || '').trim(),
         process: String(r['공정(New)'] || '').trim(),
         part: String(r['Part'] || '').trim(),
         station: String(r['STATION'] || '').trim(),
@@ -101,6 +184,7 @@ function FileUpload({ onLoad }) {
       const normRew = rework.map(r => ({
         date: parseDate(r['일자']),
         line: String(r['라인(New)'] || '').trim(),
+        lineName: String(r['라인명'] || '').trim(),
         process: String(r['공정(New)'] || '').trim(),
         part: String(r['Part'] || '').trim(),
         station: String(r['STATION'] || '').trim(),
@@ -183,9 +267,10 @@ function App() {
     [...data.good, ...data.defect, ...data.rework].forEach(r => {
       if (!r.process) return;
       if (!m[r.process]) {
-        m[r.process] = { line: r.line, stations: new Set(), defectTypes: new Set(), reworkTypes: new Set(), parts: new Set() };
+        m[r.process] = { line: r.line, lineNames: new Set(), stations: new Set(), defectTypes: new Set(), reworkTypes: new Set(), parts: new Set() };
       }
       if (r.line && !m[r.process].line) m[r.process].line = r.line;
+      if (r.lineName) m[r.process].lineNames.add(r.lineName);
       if (r.part) m[r.process].parts.add(r.part);
     });
     data.defect.forEach(r => {
@@ -202,6 +287,7 @@ function App() {
     for (const p in m) {
       out[p] = {
         line: m[p].line,
+        lineNames: [...m[p].lineNames].sort(),
         stations: [...m[p].stations].sort(),
         defectTypes: [...m[p].defectTypes].sort(),
         reworkTypes: [...m[p].reworkTypes].sort(),
@@ -218,13 +304,18 @@ function App() {
     return processes.filter(p => processInfo[p]?.line === lineFilter);
   }, [processes, processInfo, lineFilter]);
   
-  const isIncluded = useCallback((process, station, type, kind) => {
+  const isIncluded = useCallback((process, lineName, station, kind) => {
     const c = config[process];
     if (!c) return true;
-    if (c.stations && c.stations.length > 0 && !c.stations.includes(station)) return false;
-    const tk = kind === 'defect' ? 'defectTypes' : 'reworkTypes';
-    if (c[tk] && c[tk].length > 0 && !c[tk].includes(type)) return false;
-    return true;
+    // 라인명 필터 (모든 kind 공통)
+    if (c.lineNames && c.lineNames.length > 0 && !c.lineNames.includes(lineName)) return false;
+    // 양품(good)은 STATION 필터 무시
+    if (kind === 'good') return true;
+    // STATION 필터
+    const key = kind === 'rework' ? 'reworkStations' : 'defectStations';
+    const sel = c[key];
+    if (!sel || sel.length === 0) return true;
+    return sel.includes(station);
   }, [config]);
   
   const processStats = useMemo(() => {
@@ -241,18 +332,19 @@ function App() {
     data.good.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!result[r.process]) return;
+      if (!isIncluded(r.process, r.lineName, null, 'good')) return;
       result[r.process].good[r.date.getMonth()] += r.qty;
     });
     data.defect.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!result[r.process]) return;
-      if (!isIncluded(r.process, r.station, r.type, 'defect')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, 'defect')) return;
       result[r.process].defect[r.date.getMonth()] += r.qty;
     });
     data.rework.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!result[r.process]) return;
-      if (!isIncluded(r.process, r.station, r.type, 'rework')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, 'rework')) return;
       result[r.process].rework[r.date.getMonth()] += r.qty;
     });
     return result;
@@ -579,6 +671,7 @@ function TopBottomCard({ data, year, activeProcesses, isIncluded }) {
     data.good.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
+      if (!isIncluded(r.process, r.lineName, null, 'good')) return;
       const k = key(r);
       if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
       m[k].good += r.qty;
@@ -586,7 +679,7 @@ function TopBottomCard({ data, year, activeProcesses, isIncluded }) {
     data.defect.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
-      if (!isIncluded(r.process, r.station, r.type, 'defect')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, 'defect')) return;
       const k = key(r);
       if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
       m[k].defect += r.qty;
@@ -594,7 +687,7 @@ function TopBottomCard({ data, year, activeProcesses, isIncluded }) {
     data.rework.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
-      if (!isIncluded(r.process, r.station, r.type, 'rework')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, 'rework')) return;
       const k = key(r);
       if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
       m[k].rework += r.qty;
@@ -761,12 +854,13 @@ function PartTable({ data, year, process, processInfo, isIncluded }) {
     data.good.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (r.process !== process || !m[r.part]) return;
+      if (!isIncluded(r.process, r.lineName, null, 'good')) return;
       m[r.part].good += r.qty;
     });
     data.defect.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (r.process !== process || !m[r.part]) return;
-      if (!isIncluded(r.process, r.station, r.type, 'defect')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, 'defect')) return;
       m[r.part].defect += r.qty;
       const t = r.type || '(미분류)';
       m[r.part].defectTypes[t] = (m[r.part].defectTypes[t] || 0) + r.qty;
@@ -774,7 +868,7 @@ function PartTable({ data, year, process, processInfo, isIncluded }) {
     data.rework.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (r.process !== process || !m[r.part]) return;
-      if (!isIncluded(r.process, r.station, r.type, 'rework')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, 'rework')) return;
       m[r.part].rework += r.qty;
       const t = r.type || '(미분류)';
       m[r.part].reworkTypes[t] = (m[r.part].reworkTypes[t] || 0) + r.qty;
@@ -926,7 +1020,7 @@ function MonthlyTypeTable({ data, year, activeProcesses, isIncluded }) {
     rows.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
-      if (!isIncluded(r.process, r.station, r.type, kind)) return;
+      if (!isIncluded(r.process, r.lineName, r.station, kind)) return;
       const t = r.type || '(미분류)';
       if (!m[t]) m[t] = Array(12).fill(0);
       m[t][r.date.getMonth()] += r.qty;
@@ -1054,6 +1148,10 @@ function DetailTab({ data, year, activeProcesses, processStats, processInfo, isI
 // ─────────── CONFIG MODAL ───────────
 function ConfigModal({ processes, processInfo, config, onChange, onClose }) {
   const [local, setLocal] = useState(config);
+  const [importError, setImportError] = useState('');
+  
+  // config가 외부에서 바뀌면 local도 동기화
+  useEffect(() => { setLocal(config); }, [config]);
   
   const update = (next) => { setLocal(next); onChange(next); };
   
@@ -1063,54 +1161,128 @@ function ConfigModal({ processes, processInfo, config, onChange, onClose }) {
     update({ ...local, [process]: { ...(local[process] || {}), [kind]: next } });
   };
   const selectAll = (process, kind) => {
-    const all = processInfo[process]?.[kind] || [];
+    let all = [];
+    if (kind === 'lineNames') {
+      const fromData = processInfo[process]?.lineNames || [];
+      const fromPreset = PRESET_CONFIG[process]?.lineNames || [];
+      all = [...new Set([...fromData, ...fromPreset])];
+    } else {
+      const fromData = processInfo[process]?.stations || [];
+      const fromPreset = PRESET_CONFIG[process] ? 
+        [...(PRESET_CONFIG[process].reworkStations || []), ...(PRESET_CONFIG[process].defectStations || [])] : [];
+      all = [...new Set([...fromData, ...fromPreset])];
+    }
     update({ ...local, [process]: { ...(local[process] || {}), [kind]: [...all] } });
   };
   const clearKind = (process, kind) => {
     update({ ...local, [process]: { ...(local[process] || {}), [kind]: [] } });
   };
-  const reset = () => update({});
+  const clearAll = () => {
+    if (!confirm('모든 공정의 STATION 선택을 초기화합니다 (전체 미선택 = 전체 포함). 계속하시겠습니까?')) return;
+    update({});
+  };
+  const restorePreset = () => {
+    if (!confirm('사용자 분석본 기본값으로 복원합니다. 현재 변경사항은 사라집니다. 계속하시겠습니까?')) return;
+    update(JSON.parse(JSON.stringify(PRESET_CONFIG)));
+  };
+  const handleExport = () => {
+    const blob = new Blob([JSON.stringify(local, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `mfg-ftfr-config-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const handleImport = (file) => {
+    setImportError('');
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = JSON.parse(e.target.result);
+        if (typeof parsed !== 'object' || parsed === null) throw new Error('형식 오류');
+        update(parsed);
+        alert(`설정 가져오기 완료: ${Object.keys(parsed).length}개 공정`);
+      } catch (err) {
+        setImportError('JSON 파일 형식이 올바르지 않습니다.');
+      }
+    };
+    reader.readAsText(file);
+  };
   
   const grouped = useMemo(() => {
+    // PRESET에 있지만 현재 데이터에 없는 공정도 포함시켜 보여주기
+    const allProcs = new Set([...processes, ...Object.keys(PRESET_CONFIG), ...Object.keys(local)]);
     const g = { TCP: [], FE: [], Other: [] };
-    processes.forEach(p => {
-      const ln = processInfo[p]?.line || 'Other';
-      (g[ln] || g.Other).push(p);
+    [...allProcs].forEach(p => {
+      const ln = processInfo[p]?.line;
+      // 현재 데이터의 라인 정보가 없으면 PRESET 기준 추정
+      const inferredLine = ln || (Object.keys(PRESET_CONFIG).includes(p) ? 
+        (['1PC','2PC','Nospin'].includes(p) ? 'TCP' : 'FE') : 'Other');
+      (g[inferredLine] || g.Other).push(p);
     });
+    g.TCP.sort();
+    g.FE.sort();
+    g.Other.sort();
     return g;
-  }, [processes, processInfo]);
+  }, [processes, processInfo, local]);
   
-  const Column = ({ items, kind, label, accentClass, process }) => {
+  // 데이터에 등장하는 STATION + preset/local에 명시된 STATION 모두 합쳐서 표시
+  const getAllStations = (process) => {
+    const fromData = processInfo[process]?.stations || [];
+    const fromPreset = PRESET_CONFIG[process] ? 
+      [...(PRESET_CONFIG[process].reworkStations || []), ...(PRESET_CONFIG[process].defectStations || [])] : [];
+    const fromLocal = local[process] ? 
+      [...(local[process].reworkStations || []), ...(local[process].defectStations || [])] : [];
+    return [...new Set([...fromData, ...fromPreset, ...fromLocal])].sort();
+  };
+  
+  const getAllLineNames = (process) => {
+    const fromData = processInfo[process]?.lineNames || [];
+    const fromPreset = PRESET_CONFIG[process]?.lineNames || [];
+    const fromLocal = local[process]?.lineNames || [];
+    return [...new Set([...fromData, ...fromPreset, ...fromLocal])].sort();
+  };
+  
+  const StationColumn = ({ process, allStations, dataStations, kind, label }) => {
     const sel = (local[process] && local[process][kind]) || [];
+    const colors = {
+      lineNames: { border: 'border-slate-400', headerBg: 'bg-slate-100 text-slate-800', selBtn: 'bg-slate-200 text-slate-700 hover:bg-slate-300' },
+      reworkStations: { border: 'border-amber-300', headerBg: 'bg-amber-50 text-amber-800', selBtn: 'bg-amber-100 text-amber-700 hover:bg-amber-200' },
+      defectStations: { border: 'border-red-300', headerBg: 'bg-red-50 text-red-800', selBtn: 'bg-red-100 text-red-700 hover:bg-red-200' }
+    }[kind] || { border: 'border-gray-300', headerBg: 'bg-gray-50 text-gray-800', selBtn: 'bg-gray-100 text-gray-700 hover:bg-gray-200' };
     return (
-      <div className="border rounded p-2 bg-white min-h-[120px]">
-        <div className={`flex items-center justify-between mb-2 pb-1 border-b ${accentClass}`}>
-          <span className="text-xs font-bold">{label} ({items.length})</span>
+      <div className={`border-2 ${colors.border} rounded-lg overflow-hidden bg-white`}>
+        <div className={`${colors.headerBg} px-3 py-2 flex items-center justify-between`}>
+          <span className="text-xs font-bold">{label}</span>
           <div className="flex gap-1">
             <button onClick={() => selectAll(process, kind)}
-              className="text-[10px] px-1.5 py-0.5 bg-blue-50 text-blue-700 hover:bg-blue-100 rounded">전체</button>
+              className={`text-[10px] px-2 py-0.5 ${colors.selBtn} rounded font-medium`}>전체</button>
             <button onClick={() => clearKind(process, kind)}
-              className="text-[10px] px-1.5 py-0.5 bg-gray-100 text-gray-600 hover:bg-gray-200 rounded">해제</button>
+              className="text-[10px] px-2 py-0.5 bg-gray-200 text-gray-700 hover:bg-gray-300 rounded font-medium">해제</button>
           </div>
         </div>
-        <div className="space-y-0.5 max-h-40 overflow-y-auto">
-          {items.length === 0 ? (
-            <div className="text-[10px] text-gray-400 italic">없음</div>
-          ) : items.map(item => (
-            <label key={item} className="flex items-center gap-1.5 cursor-pointer hover:bg-gray-50 px-1 rounded">
-              <input type="checkbox" 
-                checked={sel.includes(item)} 
-                onChange={() => toggle(process, kind, item)}
-                className="w-3.5 h-3.5" />
-              <span className="text-[11px] text-gray-700 truncate" title={item}>{item}</span>
-            </label>
-          ))}
+        <div className="p-2 max-h-56 overflow-y-auto">
+          {allStations.length === 0 ? (
+            <div className="text-xs text-gray-400 italic text-center py-3">항목 없음</div>
+          ) : allStations.map(st => {
+            const inData = dataStations.includes(st);
+            return (
+              <label key={st} className="flex items-center gap-2 cursor-pointer hover:bg-gray-50 px-1.5 py-0.5 rounded">
+                <input type="checkbox" 
+                  checked={sel.includes(st)} 
+                  onChange={() => toggle(process, kind, st)}
+                  className="w-3.5 h-3.5" />
+                <span className={`text-xs truncate flex-1 ${inData ? 'text-gray-800' : 'text-gray-400 italic'}`} title={st + (inData ? '' : ' (현재 데이터에 없음)')}>
+                  {st}
+                </span>
+              </label>
+            );
+          })}
         </div>
-        {items.length > 0 && (
-          sel.length === 0 
-            ? <div className="mt-1 text-[10px] text-amber-700">⚠ 미선택 = 전체 포함</div>
-            : <div className="mt-1 text-[10px] text-blue-700">✓ {sel.length} / {items.length}</div>
-        )}
+        <div className={`px-3 py-1 border-t text-[10px] ${sel.length === 0 ? 'text-amber-700 bg-amber-50' : 'text-blue-700 bg-blue-50'}`}>
+          {sel.length === 0 ? '⚠ 미선택 = 전체 포함' : `✓ ${sel.length} 선택`}
+        </div>
       </div>
     );
   };
@@ -1120,19 +1292,28 @@ function ConfigModal({ processes, processInfo, config, onChange, onClose }) {
     return (
       <div className="mb-6">
         <h3 className={`text-base font-bold ${headerColor} mb-3 px-3 py-2 rounded-lg`}>{title} ({list.length}개)</h3>
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
           {list.map(process => {
             const info = processInfo[process];
+            const dataStations = info?.stations || [];
+            const allStations = getAllStations(process);
+            const inCurrentData = processes.includes(process);
+            const hasPreset = !!PRESET_CONFIG[process];
             return (
-              <div key={process} className="border rounded-lg p-3 bg-gray-50">
-                <div className="font-bold text-gray-800 mb-2 flex items-center gap-2">
-                  <span className="text-xs px-2 py-0.5 bg-gray-700 text-white rounded">{info?.line}</span>
+              <div key={process} className={`border rounded-lg p-3 ${inCurrentData ? 'bg-gray-50' : 'bg-yellow-50 border-yellow-200'}`}>
+                <div className="font-bold text-gray-800 mb-2 flex items-center gap-2 flex-wrap">
+                  <span className="text-xs px-2 py-0.5 bg-gray-700 text-white rounded">{info?.line || (Object.keys(PRESET_CONFIG).includes(process) ? '?' : '-')}</span>
                   <span>{process}</span>
+                  {!inCurrentData && <span className="text-[10px] px-1.5 py-0.5 bg-yellow-200 text-yellow-800 rounded">현재 데이터 없음</span>}
+                  {hasPreset && <span className="text-[10px] px-1.5 py-0.5 bg-emerald-100 text-emerald-700 rounded">📋 분석본 있음</span>}
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                  <Column items={info?.stations || []} kind="stations" label="Station" accentClass="text-gray-700" process={process} />
-                  <Column items={info?.defectTypes || []} kind="defectTypes" label="2차불량 유형" accentClass="text-red-700" process={process} />
-                  <Column items={info?.reworkTypes || []} kind="reworkTypes" label="1차불량 유형" accentClass="text-amber-700" process={process} />
+                  <StationColumn process={process} allStations={getAllLineNames(process)} dataStations={info?.lineNames || []}
+                    kind="lineNames" label="🏷️ 라인명 (공통 필터)" />
+                  <StationColumn process={process} allStations={allStations} dataStations={dataStations}
+                    kind="reworkStations" label="🟡 1차불량 (재작업) STATION" />
+                  <StationColumn process={process} allStations={allStations} dataStations={dataStations}
+                    kind="defectStations" label="🔴 2차불량 (NG) STATION" />
                 </div>
               </div>
             );
@@ -1144,22 +1325,53 @@ function ConfigModal({ processes, processInfo, config, onChange, onClose }) {
   
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-white rounded-xl shadow-2xl max-w-7xl w-full max-h-[92vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+      <div className="bg-white rounded-xl shadow-2xl max-w-[1500px] w-full max-h-[94vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
         <div className="p-5 bg-gradient-to-r from-emerald-600 to-teal-600 text-white rounded-t-xl flex items-center justify-between">
           <div>
             <h2 className="text-2xl font-bold">⚙️ FTFR 집계 설정</h2>
-            <p className="text-sm text-emerald-100 mt-1">공정(New)별로 Station / 2차불량 유형 / 1차불량 유형 선택 (선택 없으면 전체 포함)</p>
+            <p className="text-sm text-emerald-100 mt-1">공정별 라인명 / 1차불량(재작업) / 2차불량(NG) STATION 선택 · 미선택 = 전체 포함 · <b>변경 즉시 자동저장</b></p>
           </div>
           <button onClick={onClose} className="text-3xl hover:bg-white hover:bg-opacity-20 rounded-lg w-10 h-10 flex items-center justify-center">×</button>
         </div>
+        
+        {/* 액션 바 */}
+        <div className="px-5 py-3 bg-gray-100 border-b flex items-center justify-between gap-2 flex-wrap">
+          <div className="flex gap-2 flex-wrap">
+            <button onClick={restorePreset}
+              className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-bold">
+              📋 분석본 기본값으로 복원
+            </button>
+            <button onClick={clearAll}
+              className="px-3 py-1.5 bg-red-100 hover:bg-red-200 text-red-700 rounded text-sm font-medium">
+              🗑️ 전체 초기화
+            </button>
+          </div>
+          <div className="flex gap-2 flex-wrap items-center">
+            <button onClick={handleExport}
+              className="px-3 py-1.5 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded text-sm font-medium">
+              📤 내보내기 (JSON)
+            </button>
+            <label className="px-3 py-1.5 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded text-sm font-medium cursor-pointer">
+              📥 가져오기 (JSON)
+              <input type="file" accept=".json,application/json" className="hidden" onChange={(e) => {
+                if (e.target.files[0]) handleImport(e.target.files[0]);
+                e.target.value = '';
+              }} />
+            </label>
+            {importError && <span className="text-xs text-red-600">{importError}</span>}
+          </div>
+        </div>
+        
         <div className="overflow-y-auto p-5 flex-1">
           <Section title="🔵 TCP" list={grouped.TCP} headerColor="bg-blue-100 text-blue-800" />
           <Section title="🟣 FE" list={grouped.FE} headerColor="bg-purple-100 text-purple-800" />
           {grouped.Other.length > 0 && <Section title="기타" list={grouped.Other} headerColor="bg-gray-100 text-gray-800" />}
         </div>
-        <div className="p-4 border-t bg-gray-50 rounded-b-xl flex justify-between items-center">
-          <button onClick={reset} className="px-4 py-2 bg-red-100 text-red-700 hover:bg-red-200 rounded-lg font-medium">🗑️ 전체 초기화</button>
-          <div className="text-xs text-gray-500">총 {processes.length}개 공정 · 변경 즉시 저장</div>
+        
+        <div className="p-3 border-t bg-gray-50 rounded-b-xl flex justify-between items-center">
+          <div className="text-xs text-gray-500">
+            현재 데이터 공정: {processes.length}개 · 분석본 PRESET: {Object.keys(PRESET_CONFIG).length}개
+          </div>
           <button onClick={onClose} className="px-6 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold">완료</button>
         </div>
       </div>
