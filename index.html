@@ -1575,7 +1575,9 @@ function PartAliasModal({ rawData, alias, onChange, onClose }) {
   const [bulkMode, setBulkMode] = useState(false);
   const [bulkText, setBulkText] = useState('');
   
-  useEffect(() => { setLocal(alias); }, [alias]);
+  // alias 외부 변경 동기화 useEffect는 의도적으로 제거
+  // (update가 항상 onChange로 부모와 동기시키므로 불필요하고, 
+  //  IME 한글 입력 중 race condition을 일으켜 입력값이 날아갈 수 있음)
   
   // 데이터에 등장하는 partno 자동 추출 (사용 빈도 정보 포함)
   const allPartnos = useMemo(() => {
@@ -1652,14 +1654,12 @@ function PartAliasModal({ rawData, alias, onChange, onClose }) {
       alert('미매핑된 partno가 없습니다. 모두 매핑되어 있어요! 🎉');
       return;
     }
-    const rows = [['PartNo', '품명(여기에 입력)', '데이터 건수']];
+    const rows = [['PartNo', '품명', '데이터 건수']];
     unmapped.forEach(({ partno, count }) => {
       rows.push([partno, '', count]);
     });
     const ws = XLSX.utils.aoa_to_sheet(rows);
     ws['!cols'] = [{ wch: 28 }, { wch: 24 }, { wch: 12 }];
-    // 헤더 굵게 (간단하게)
-    ws['A1'].s = ws['B1'].s = ws['C1'].s = { font: { bold: true } };
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'PartNo 매핑');
     XLSX.writeFile(wb, `mfg-ftfr-미매핑-${new Date().toISOString().slice(0,10)}.xlsx`);
@@ -1671,36 +1671,59 @@ function PartAliasModal({ rawData, alias, onChange, onClose }) {
     reader.onload = (e) => {
       try {
         const wb = XLSX.read(e.target.result, { type: 'array' });
-        const ws = wb.Sheets[wb.SheetNames[0]];
+        const sheetName = wb.SheetNames[0];
+        const ws = wb.Sheets[sheetName];
         const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-        // 헤더 행 찾기 (PartNo 컬럼과 품명 컬럼 위치)
+        
+        // 헤더 행 찾기: PartNo 컬럼과 품명 컬럼 위치 (더 유연한 매칭)
+        const isPartHeader = (c) => {
+          const s = String(c ?? '').trim().toLowerCase();
+          return s === 'partno' || s === 'part no' || s === 'part_no' || s === 'part' || s === '부품번호' || s === 'part number';
+        };
+        const isNameHeader = (c) => {
+          const s = String(c ?? '').trim();
+          return s.startsWith('품명') || s === '제품명' || s.toLowerCase() === 'name' || s.toLowerCase() === 'product';
+        };
+        
         let hdrIdx = -1, partCol = -1, nameCol = -1;
-        for (let i = 0; i < rows.length; i++) {
+        for (let i = 0; i < Math.min(rows.length, 10); i++) {
           const r = rows[i];
           if (!Array.isArray(r)) continue;
-          const pIdx = r.findIndex(c => String(c).trim().toLowerCase() === 'partno');
-          const nIdx = r.findIndex(c => String(c).startsWith('품명'));
+          const pIdx = r.findIndex(isPartHeader);
+          const nIdx = r.findIndex(isNameHeader);
           if (pIdx >= 0 && nIdx >= 0) {
             hdrIdx = i; partCol = pIdx; nameCol = nIdx; break;
           }
         }
+        
         if (hdrIdx === -1) {
-          alert('헤더(PartNo, 품명)를 찾을 수 없습니다.\n첫 번째 시트의 첫 번째 행에 "PartNo", "품명..." 컬럼이 있어야 해요.');
+          const firstRow = (rows[0] || []).map(c => String(c ?? '')).join(' | ');
+          alert(`헤더(PartNo, 품명)를 찾을 수 없습니다.\n\n시트명: "${sheetName}"\n첫 행: ${firstRow.slice(0, 120)}\n\n파일의 첫 번째 시트의 1~10행 안에 "PartNo"와 "품명"으로 시작하는 컬럼이 있어야 해요.`);
           return;
         }
+        
         const next = { ...local };
-        let added = 0, skipped = 0;
+        let added = 0, updated = 0, skipped = 0;
         for (let i = hdrIdx + 1; i < rows.length; i++) {
           const r = rows[i];
           if (!Array.isArray(r)) continue;
           const p = String(r[partCol] ?? '').trim();
           const n = String(r[nameCol] ?? '').trim();
           if (!p) continue;
-          if (n) { next[p] = n; added++; }
-          else skipped++;
+          if (n) {
+            if (next[p] === n) continue;
+            if (next[p]) updated++; else added++;
+            next[p] = n;
+          } else skipped++;
         }
+        
+        if (added === 0 && updated === 0) {
+          alert(`품명 컬럼(${nameCol+1}번째)에 입력된 값이 없어요.\n\n빈 항목 ${skipped}개 발견. 엑셀에서 "${rows[hdrIdx][nameCol]}" 컬럼에 품명을 입력하고 다시 업로드해주세요.`);
+          return;
+        }
+        
         update(next);
-        alert(`품명 매핑 가져오기 완료\n· 추가/수정: ${added}개\n· 빈 항목 스킵: ${skipped}개`);
+        alert(`✅ 품명 매핑 가져오기 완료\n· 새로 추가: ${added}개\n· 수정: ${updated}개\n· 빈 항목 스킵: ${skipped}개`);
       } catch (e) {
         alert('파일 형식 오류: ' + e.message);
       }
