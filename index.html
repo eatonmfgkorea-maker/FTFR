@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>MFG FTFR 분석 V014</title>
+<title>MFG FTFR 분석 V015</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
@@ -33,7 +33,7 @@ const { useState, useEffect, useMemo, useCallback } = React;
 
 const STORAGE_KEY = 'mfg_ftfr_config_v6';
 const ALIAS_KEY = 'mfg_ftfr_part_alias';
-const APP_VERSION = 'V014';
+const APP_VERSION = 'V015';
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const LINE_GROUPS = ['TCP', 'FE'];
 
@@ -1645,6 +1645,69 @@ function PartAliasModal({ rawData, alias, onChange, onClose }) {
     reader.readAsText(file);
   };
   
+  // 미매핑 partno만 .xlsx로 다운로드 (사용자가 품명 채워서 다시 업로드)
+  const handleDownloadUnmappedXlsx = () => {
+    const unmapped = allEntries.filter(({ partno }) => !local[partno]);
+    if (unmapped.length === 0) {
+      alert('미매핑된 partno가 없습니다. 모두 매핑되어 있어요! 🎉');
+      return;
+    }
+    const rows = [['PartNo', '품명(여기에 입력)', '데이터 건수']];
+    unmapped.forEach(({ partno, count }) => {
+      rows.push([partno, '', count]);
+    });
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws['!cols'] = [{ wch: 28 }, { wch: 24 }, { wch: 12 }];
+    // 헤더 굵게 (간단하게)
+    ws['A1'].s = ws['B1'].s = ws['C1'].s = { font: { bold: true } };
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'PartNo 매핑');
+    XLSX.writeFile(wb, `mfg-ftfr-미매핑-${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+  
+  // 채워진 .xlsx 업로드 → alias에 병합
+  const handleUploadFilledXlsx = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+        // 헤더 행 찾기 (PartNo 컬럼과 품명 컬럼 위치)
+        let hdrIdx = -1, partCol = -1, nameCol = -1;
+        for (let i = 0; i < rows.length; i++) {
+          const r = rows[i];
+          if (!Array.isArray(r)) continue;
+          const pIdx = r.findIndex(c => String(c).trim().toLowerCase() === 'partno');
+          const nIdx = r.findIndex(c => String(c).startsWith('품명'));
+          if (pIdx >= 0 && nIdx >= 0) {
+            hdrIdx = i; partCol = pIdx; nameCol = nIdx; break;
+          }
+        }
+        if (hdrIdx === -1) {
+          alert('헤더(PartNo, 품명)를 찾을 수 없습니다.\n첫 번째 시트의 첫 번째 행에 "PartNo", "품명..." 컬럼이 있어야 해요.');
+          return;
+        }
+        const next = { ...local };
+        let added = 0, skipped = 0;
+        for (let i = hdrIdx + 1; i < rows.length; i++) {
+          const r = rows[i];
+          if (!Array.isArray(r)) continue;
+          const p = String(r[partCol] ?? '').trim();
+          const n = String(r[nameCol] ?? '').trim();
+          if (!p) continue;
+          if (n) { next[p] = n; added++; }
+          else skipped++;
+        }
+        update(next);
+        alert(`품명 매핑 가져오기 완료\n· 추가/수정: ${added}개\n· 빈 항목 스킵: ${skipped}개`);
+      } catch (e) {
+        alert('파일 형식 오류: ' + e.message);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+  
   const applyBulk = () => {
     // 형식: "partno → 품명" 또는 "partno = 품명" 또는 "partno\t품명" 라인별로
     const lines = bulkText.split(/\r?\n/).filter(l => l.trim());
@@ -1675,7 +1738,7 @@ function PartAliasModal({ rawData, alias, onChange, onClose }) {
           <div>
             <h2 className="text-2xl font-bold">🏷️ 품명 매핑</h2>
             <p className="text-sm text-blue-100 mt-1">
-              partno → 품명 (예: <span className="font-mono bg-white/20 px-1 rounded">ED-19729-3-F1 → HM</span>) · 변경 즉시 자동저장
+              partno → 품명 (예: <span className="font-mono bg-white/20 px-1 rounded">ED-19729-3-F1 → HM</span>) · 변경 즉시 자동저장 · <b>미매핑은 xlsx 다운로드 → 입력 → 업로드</b>
             </p>
           </div>
           <button onClick={onClose} className="text-3xl hover:bg-white hover:bg-opacity-20 rounded-lg w-10 h-10 flex items-center justify-center">×</button>
@@ -1694,11 +1757,22 @@ function PartAliasModal({ rawData, alias, onChange, onClose }) {
             className={`px-3 py-1.5 rounded text-sm font-medium ${bulkMode ? 'bg-amber-500 text-white' : 'bg-amber-100 text-amber-700 hover:bg-amber-200'}`}>
             ✏️ 일괄 입력
           </button>
+          <button onClick={handleDownloadUnmappedXlsx}
+            className="px-3 py-1.5 bg-emerald-100 hover:bg-emerald-200 text-emerald-700 rounded text-sm font-medium">
+            📊 미매핑 다운로드 (.xlsx)
+          </button>
+          <label className="px-3 py-1.5 bg-emerald-100 hover:bg-emerald-200 text-emerald-700 rounded text-sm font-medium cursor-pointer">
+            📊 채워서 업로드 (.xlsx)
+            <input type="file" accept=".xlsx,.xls" className="hidden" onChange={(e) => {
+              if (e.target.files[0]) handleUploadFilledXlsx(e.target.files[0]);
+              e.target.value = '';
+            }} />
+          </label>
           <button onClick={handleExport} className="px-3 py-1.5 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded text-sm font-medium">
-            📤 내보내기
+            📤 JSON 백업
           </button>
           <label className="px-3 py-1.5 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded text-sm font-medium cursor-pointer">
-            📥 가져오기
+            📥 JSON 복원
             <input type="file" accept=".json" className="hidden" onChange={(e) => {
               if (e.target.files[0]) handleImport(e.target.files[0]);
               e.target.value = '';
@@ -1773,7 +1847,7 @@ function PartAliasModal({ rawData, alias, onChange, onClose }) {
         {/* 풋터 */}
         <div className="p-3 border-t bg-gray-50 rounded-b-xl flex justify-between items-center">
           <div className="text-xs text-gray-500">
-            데이터 partno: <b>{totalInData}</b>개 · 매핑됨: <b className="text-blue-700">{mappedInData}</b>개 · 전체 매핑: <b>{totalMapped}</b>개
+            데이터 partno: <b>{totalInData}</b>개 · 매핑됨: <b className="text-blue-700">{mappedInData}</b>개 · <b className="text-amber-700">미매핑: {totalInData - mappedInData}개</b> · 전체 매핑: <b>{totalMapped}</b>개
           </div>
           <button onClick={onClose} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold">완료</button>
         </div>
