@@ -2,12 +2,21 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>MFG FTFR 분석 V009</title>
+<title>MFG FTFR 분석 V011</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<!-- mdb-reader: Access .mdb 파서 (브라우저 ESM) -->
+<script type="module">
+  import { Buffer } from 'https://cdn.jsdelivr.net/npm/buffer@6.0.3/+esm';
+  import MDBReader from 'https://cdn.jsdelivr.net/npm/mdb-reader@3.1.0/+esm';
+  window.Buffer = Buffer;
+  window.MDBReader = MDBReader;
+  window.__mdbReaderReady = true;
+  window.dispatchEvent(new Event('mdb-reader-ready'));
+</script>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", sans-serif; }
   .tabular-nums { font-variant-numeric: tabular-nums; }
@@ -23,9 +32,20 @@
 const { useState, useEffect, useMemo, useCallback } = React;
 
 const STORAGE_KEY = 'mfg_ftfr_config_v5';
-const APP_VERSION = 'V009';
+const ALIAS_KEY = 'mfg_ftfr_part_alias';
+const APP_VERSION = 'V011';
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const LINE_GROUPS = ['TCP', 'FE'];
+
+const loadAlias = () => {
+  try {
+    const s = localStorage.getItem(ALIAS_KEY);
+    return s ? JSON.parse(s) : {};
+  } catch { return {}; }
+};
+const saveAlias = (m) => {
+  try { localStorage.setItem(ALIAS_KEY, JSON.stringify(m)); } catch {}
+};
 
 // 사용자 분석본 기반 PRESET (공정(New)별 라인명/1차불량/2차불량 STATION)
 const PRESET_CONFIG = {
@@ -140,59 +160,222 @@ const fmtPct = (n) => {
 };
 const sumArr = (arr) => arr.reduce((a, b) => a + b, 0);
 
+// ─────────── MDB → FTFR 데이터 변환 ───────────
+// 라인명 → 공정(New) 매핑 (mfg-report 룰 + FTFR 세분화)
+const TCP_LINE_MAP = {
+  'LD 1PC': '1PC', 'LSD 1PC': '1PC', 'LD IPC': '1PC',
+  'LD 2PC': '2PC', 'LSD 2PC': '2PC', 'ELD 2PC': '2PC',
+  'Nospin': 'Nospin'
+};
+const TCP_EXCLUDE = new Set(['PACK Sub', 'Pack Sub', 'Washing', 'Open']);
+const FE_LINE_MAP = {
+  'Auto GVV': 'A/GVV', 'AUTO GVV': 'A/GVV',
+  'Manual GVV': 'M/GVV',
+  'Auto FLVV': 'A/FLVV', 'New FLVV': 'A/FLVV',
+  'COMBO FLVV': 'C/FLVV',
+  'FLVV': 'M/FLVV', 'FLVV SUB': 'M/FLVV',
+  'LVS': 'LVS', 'FTIV': 'FTIV', 'ICV': 'ICV', 'UCC': 'UCC',
+  'MEMBRANE': 'MEM'
+};
+const FE_EXCLUDE = new Set(['ATV M/C', 'UMBRELLA M/C']);
+
+const mapLineToProcess = (side, raw) => {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (side === 'TCP') {
+    if (TCP_EXCLUDE.has(s)) return null;
+    return TCP_LINE_MAP[s] || null;
+  } else {
+    if (FE_EXCLUDE.has(s)) return null;
+    return FE_LINE_MAP[s] || null;
+  }
+};
+
+const detectSide = (rows) => {
+  // 양품수량 첫 100행에서 라인명 보고 TCP/FE 판별
+  for (const r of rows.slice(0, 100)) {
+    const ln = String(r['라인명'] || '').trim();
+    if (TCP_LINE_MAP[ln] || TCP_EXCLUDE.has(ln)) return 'TCP';
+    if (FE_LINE_MAP[ln] || FE_EXCLUDE.has(ln)) return 'FE';
+  }
+  return null;
+};
+
+const waitForMdbReader = () => new Promise((resolve, reject) => {
+  if (window.MDBReader && window.Buffer) return resolve(true);
+  let settled = false;
+  const handler = () => { if (!settled) { settled = true; resolve(true); } };
+  window.addEventListener('mdb-reader-ready', handler, { once: true });
+  setTimeout(() => { if (!settled) { settled = true; reject(new Error('MDB 라이브러리 로드 실패')); } }, 8000);
+});
+
+const parseMdbFile = async (file) => {
+  await waitForMdbReader();
+  const buf = await file.arrayBuffer();
+  const reader = new window.MDBReader(window.Buffer.from(buf));
+  
+  const tables = reader.getTableNames();
+  const required = ['양품수량', '불량정보', '불량재작업'];
+  for (const t of required) {
+    if (!tables.includes(t)) {
+      throw new Error(`'${t}' 테이블이 없습니다. (있는 테이블: ${tables.join(', ')})`);
+    }
+  }
+  
+  const yp = reader.getTable('양품수량').getData();
+  const def = reader.getTable('불량정보').getData();
+  const rw = reader.getTable('불량재작업').getData();
+  
+  // TCP/FE 자동 판별
+  const side = detectSide(yp);
+  if (!side) throw new Error('TCP/FE 라인 판별 실패. 라인명을 확인하세요.');
+  
+  const toDate = (v) => {
+    if (!v) return null;
+    if (v instanceof Date) return v;
+    const d = new Date(v);
+    return isNaN(d.getTime()) ? null : d;
+  };
+  
+  const good = [];
+  for (const r of yp) {
+    const date = toDate(r['생산일자']);
+    if (!date) continue;
+    const lineName = String(r['라인명'] || '').trim();
+    const process = mapLineToProcess(side, lineName);
+    if (!process) continue;
+    good.push({
+      date, line: side, lineName, process,
+      part: String(r['partno'] || '').trim(),
+      qty: Number(r['양품수량'] || 0)
+    });
+  }
+  
+  const defect = [];
+  for (const r of def) {
+    const date = toDate(r['일자']);
+    if (!date) continue;
+    const lineName = String(r['라인명'] || '').trim();
+    const process = mapLineToProcess(side, lineName);
+    if (!process) continue;
+    defect.push({
+      date, line: side, lineName, process,
+      part: String(r['PARTNO'] || '').trim(),
+      station: String(r['STATION'] || '').trim(),
+      type: String(r['유형'] || '').trim(),
+      qty: Number(r['수량'] || 0)
+    });
+  }
+  
+  const rework = [];
+  for (const r of rw) {
+    const date = toDate(r['일자']);
+    if (!date) continue;
+    const lineName = String(r['라인명'] || '').trim();
+    const process = mapLineToProcess(side, lineName);
+    if (!process) continue;
+    rework.push({
+      date, line: side, lineName, process,
+      part: String(r['PARTNO'] || '').trim(),
+      station: String(r['STATION'] || '').trim(),
+      type: String(r['유형'] || '').trim(),
+      qty: Number(r['수량'] || 0)
+    });
+  }
+  
+  return { good, defect, rework, side };
+};
+
 // ─────────── FILE UPLOAD ───────────
 function FileUpload({ onLoad }) {
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState('');
   const [error, setError] = useState('');
   const [dragOver, setDragOver] = useState(false);
   
-  const handleFile = useCallback(async (file) => {
-    if (!file) return;
-    setLoading(true); setError('');
-    try {
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: 'array', cellDates: false });
-      for (const s of ['양품', '불량', '재작업']) {
-        if (!wb.SheetNames.includes(s)) {
-          throw new Error(`'${s}' 시트가 없습니다. (있는 시트: ${wb.SheetNames.join(', ')})`);
-        }
+  const handleXlsx = async (file) => {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array', cellDates: false });
+    for (const s of ['양품', '불량', '재작업']) {
+      if (!wb.SheetNames.includes(s)) {
+        throw new Error(`'${s}' 시트가 없습니다. (있는 시트: ${wb.SheetNames.join(', ')})`);
       }
-      const good = XLSX.utils.sheet_to_json(wb.Sheets['양품']);
-      const defect = XLSX.utils.sheet_to_json(wb.Sheets['불량']);
-      const rework = XLSX.utils.sheet_to_json(wb.Sheets['재작업']);
+    }
+    const good = XLSX.utils.sheet_to_json(wb.Sheets['양품']);
+    const defect = XLSX.utils.sheet_to_json(wb.Sheets['불량']);
+    const rework = XLSX.utils.sheet_to_json(wb.Sheets['재작업']);
+    
+    const normGood = good.map(r => ({
+      date: parseDate(r['생산일자']),
+      line: String(r['라인(New)'] || '').trim(),
+      lineName: String(r['라인명'] || '').trim(),
+      process: String(r['공정(New)'] || '').trim(),
+      part: String(r['Part'] || '').trim(),
+      qty: Number(r['양품수량'] || 0)
+    })).filter(r => r.date && r.process);
+    
+    const normDef = defect.map(r => ({
+      date: parseDate(r['일자']),
+      line: String(r['라인(New)'] || '').trim(),
+      lineName: String(r['라인명'] || '').trim(),
+      process: String(r['공정(New)'] || '').trim(),
+      part: String(r['Part'] || '').trim(),
+      station: String(r['STATION'] || '').trim(),
+      type: String(r['유형'] || '').trim(),
+      qty: Number(r['수량'] || 0)
+    })).filter(r => r.date && r.process);
+    
+    const normRew = rework.map(r => ({
+      date: parseDate(r['일자']),
+      line: String(r['라인(New)'] || '').trim(),
+      lineName: String(r['라인명'] || '').trim(),
+      process: String(r['공정(New)'] || '').trim(),
+      part: String(r['Part'] || '').trim(),
+      station: String(r['STATION'] || '').trim(),
+      type: String(r['유형'] || '').trim(),
+      qty: Number(r['수량'] || 0)
+    })).filter(r => r.date && r.process);
+    
+    return { good: normGood, defect: normDef, rework: normRew, fileName: file.name, source: 'xlsx' };
+  };
+  
+  const handleFiles = useCallback(async (files) => {
+    if (!files || !files.length) return;
+    setLoading(true); setError(''); setProgress('');
+    
+    try {
+      const fileArr = Array.from(files);
+      const xlsxFiles = fileArr.filter(f => /\.xlsx?$/i.test(f.name));
+      const mdbFiles = fileArr.filter(f => /\.(mdb|accdb)$/i.test(f.name));
       
-      const normGood = good.map(r => ({
-        date: parseDate(r['생산일자']),
-        line: String(r['라인(New)'] || '').trim(),
-        lineName: String(r['라인명'] || '').trim(),
-        process: String(r['공정(New)'] || '').trim(),
-        part: String(r['Part'] || '').trim(),
-        qty: Number(r['양품수량'] || 0)
-      })).filter(r => r.date && r.process);
-      
-      const normDef = defect.map(r => ({
-        date: parseDate(r['일자']),
-        line: String(r['라인(New)'] || '').trim(),
-        lineName: String(r['라인명'] || '').trim(),
-        process: String(r['공정(New)'] || '').trim(),
-        part: String(r['Part'] || '').trim(),
-        station: String(r['STATION'] || '').trim(),
-        type: String(r['유형'] || '').trim(),
-        qty: Number(r['수량'] || 0)
-      })).filter(r => r.date && r.process);
-      
-      const normRew = rework.map(r => ({
-        date: parseDate(r['일자']),
-        line: String(r['라인(New)'] || '').trim(),
-        lineName: String(r['라인명'] || '').trim(),
-        process: String(r['공정(New)'] || '').trim(),
-        part: String(r['Part'] || '').trim(),
-        station: String(r['STATION'] || '').trim(),
-        type: String(r['유형'] || '').trim(),
-        qty: Number(r['수량'] || 0)
-      })).filter(r => r.date && r.process);
-      
-      onLoad({ good: normGood, defect: normDef, rework: normRew, fileName: file.name });
+      if (xlsxFiles.length > 0) {
+        // Excel 모드 (단일 파일)
+        setProgress('엑셀 파싱 중...');
+        const data = await handleXlsx(xlsxFiles[0]);
+        onLoad(data);
+      } else if (mdbFiles.length > 0) {
+        // MDB 모드 (1~2개 파일, TCP+FE)
+        setProgress(`MDB 라이브러리 로드 중... (${mdbFiles.length}개 파일)`);
+        const merged = { good: [], defect: [], rework: [] };
+        const sides = [];
+        const fileNames = [];
+        
+        for (let i = 0; i < mdbFiles.length; i++) {
+          const f = mdbFiles[i];
+          setProgress(`[${i+1}/${mdbFiles.length}] ${f.name} 읽는 중...`);
+          const parsed = await parseMdbFile(f);
+          merged.good.push(...parsed.good);
+          merged.defect.push(...parsed.defect);
+          merged.rework.push(...parsed.rework);
+          sides.push(parsed.side);
+          fileNames.push(`${f.name} → ${parsed.side}`);
+          setProgress(`[${i+1}/${mdbFiles.length}] ${parsed.side}: 양품 ${parsed.good.length.toLocaleString()} / 불량 ${parsed.defect.length.toLocaleString()} / 재작업 ${parsed.rework.length.toLocaleString()}`);
+        }
+        
+        onLoad({ ...merged, fileName: fileNames.join(', '), source: 'mdb' });
+      } else {
+        throw new Error('지원되는 파일 형식: .xlsx / .mdb / .accdb');
+      }
     } catch (e) {
       setError(e.message || '파일 읽기 실패');
     } finally {
@@ -209,21 +392,29 @@ function FileUpload({ onLoad }) {
           onDragLeave={() => setDragOver(false)}
           onDrop={(e) => {
             e.preventDefault(); setDragOver(false);
-            if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+            if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
           }}>
           <div className="text-6xl mb-4">📊</div>
-          <div className="text-2xl font-bold text-gray-700">FTFR 엑셀 파일 업로드</div>
-          <div className="text-sm text-gray-500 mt-3">
-            <span className="bg-gray-100 px-2 py-1 rounded mx-1">양품</span>
-            <span className="bg-gray-100 px-2 py-1 rounded mx-1">불량</span>
-            <span className="bg-gray-100 px-2 py-1 rounded mx-1">재작업</span>
-            시트 (공정(New) / 라인(New) / Part 컬럼 사용)
+          <div className="text-2xl font-bold text-gray-700">FTFR 데이터 파일 업로드</div>
+          <div className="text-sm text-gray-500 mt-3 space-y-1">
+            <div>
+              <span className="bg-blue-100 text-blue-700 px-2 py-0.5 rounded mx-1 font-bold">.xlsx</span>
+              양품/불량/재작업 시트 (Power Query 정제된 형식)
+            </div>
+            <div>
+              <span className="bg-purple-100 text-purple-700 px-2 py-0.5 rounded mx-1 font-bold">.mdb</span>
+              Access 직접 업로드 — TCPD/FEPC 둘 다 한번에 선택 가능
+            </div>
           </div>
-          {loading && <div className="text-blue-600 mt-6 font-bold">⏳ 로딩 중...</div>}
-          {error && <div className="text-red-600 mt-6 font-bold">❌ {error}</div>}
+          {loading && (
+            <div className="text-blue-600 mt-6 font-bold">
+              ⏳ {progress || '로딩 중...'}
+            </div>
+          )}
+          {error && <div className="text-red-600 mt-6 font-bold whitespace-pre-line">❌ {error}</div>}
         </div>
-        <input type="file" accept=".xlsx,.xls" className="hidden" onChange={(e) => {
-          if (e.target.files[0]) handleFile(e.target.files[0]);
+        <input type="file" accept=".xlsx,.xls,.mdb,.accdb" multiple className="hidden" onChange={(e) => {
+          if (e.target.files.length) handleFiles(e.target.files);
           e.target.value = '';
         }} />
       </label>
@@ -232,7 +423,10 @@ function FileUpload({ onLoad }) {
         <div className="text-sm text-gray-700 space-y-1">
           <div>• <b>FTFR(ppm)</b> = 재작업 ÷ 총수량 × 1,000,000</div>
           <div>• <b>총수량(투입)</b> = 양품 + 불량</div>
-          <div>• 공정(New)별 Station / 불량유형 / 재작업유형 선택해 집계 범위 지정</div>
+          <div>• 공정(New)별 Station 선택해 집계 범위 지정 (자동저장)</div>
+          <div className="pt-1 text-xs text-gray-500">
+            💡 .mdb는 TCPD_생산현황_DB.mdb / FEPC_IMTV_생산현황_DB.mdb 둘 다 동시 선택 시 자동 통합
+          </div>
         </div>
       </div>
     </div>
@@ -241,12 +435,30 @@ function FileUpload({ onLoad }) {
 
 // ─────────── APP ───────────
 function App() {
-  const [data, setData] = useState(null);
+  const [rawData, setRawData] = useState(null);
   const [year, setYear] = useState(null);
   const [tab, setTab] = useState('main');
   const [lineFilter, setLineFilter] = useState('all');
   const [config, setConfig] = useState(loadConfig);
   const [showConfig, setShowConfig] = useState(false);
+  const [partAlias, setPartAlias] = useState(loadAlias);
+  const [showAlias, setShowAlias] = useState(false);
+  
+  // partno → 품명 매핑 적용된 data (모든 자식 useMemo가 이걸 사용)
+  const data = useMemo(() => {
+    if (!rawData) return null;
+    if (!partAlias || Object.keys(partAlias).length === 0) return rawData;
+    const apply = (rows) => rows.map(r => {
+      const aliased = partAlias[r.part];
+      return aliased ? { ...r, part: aliased } : r;
+    });
+    return {
+      ...rawData,
+      good: apply(rawData.good),
+      defect: apply(rawData.defect),
+      rework: apply(rawData.rework)
+    };
+  }, [rawData, partAlias]);
   
   const availableYears = useMemo(() => {
     if (!data) return [];
@@ -365,7 +577,7 @@ function App() {
           <h1 className="text-3xl font-bold text-gray-800 mb-6">
             📈 MFG FTFR 분석 <span className="text-sm text-gray-400 font-normal ml-2">{APP_VERSION}</span>
           </h1>
-          <FileUpload onLoad={setData} />
+          <FileUpload onLoad={setRawData} />
         </div>
       </div>
     );
@@ -378,7 +590,9 @@ function App() {
           lineFilter={lineFilter} setLineFilter={setLineFilter}
           tab={tab} setTab={setTab}
           onShowConfig={() => setShowConfig(true)}
-          onReset={() => { setData(null); setYear(null); }} />
+          onShowAlias={() => setShowAlias(true)}
+          aliasCount={Object.keys(partAlias).length}
+          onReset={() => { setRawData(null); setYear(null); }} />
         
         {tab === 'main' && (
           <MainTab year={year} data={data} activeProcesses={activeProcesses}
@@ -397,13 +611,20 @@ function App() {
             onChange={(c) => { setConfig(c); saveConfig(c); }}
             onClose={() => setShowConfig(false)} />
         )}
+        
+        {showAlias && (
+          <PartAliasModal rawData={rawData}
+            alias={partAlias}
+            onChange={(a) => { setPartAlias(a); saveAlias(a); }}
+            onClose={() => setShowAlias(false)} />
+        )}
       </div>
     </div>
   );
 }
 
 // ─────────── HEADER ───────────
-function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter, tab, setTab, onShowConfig, onReset }) {
+function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter, tab, setTab, onShowConfig, onShowAlias, aliasCount, onReset }) {
   return (
     <div className="mb-6">
       <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
@@ -412,6 +633,9 @@ function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter
             📈 MFG FTFR 분석 <span className="text-sm text-gray-400 font-normal ml-2">{APP_VERSION}</span>
           </h1>
           <div className="text-xs text-gray-500 mt-1">
+            <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold mr-2 ${data.source === 'mdb' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
+              {data.source === 'mdb' ? '🗃️ MDB' : '📄 XLSX'}
+            </span>
             📁 {data.fileName} · 양품 {data.good.length.toLocaleString()}행 · 불량 {data.defect.length.toLocaleString()}행 · 재작업 {data.rework.length.toLocaleString()}행
           </div>
         </div>
@@ -431,6 +655,15 @@ function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter
           <button onClick={onShowConfig}
             className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg shadow font-bold text-sm">
             ⚙️ 집계 설정
+          </button>
+          <button onClick={onShowAlias}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg shadow font-bold text-sm relative">
+            🏷️ 품명 매핑
+            {aliasCount > 0 && (
+              <span className="absolute -top-1 -right-1 bg-amber-400 text-white text-[10px] rounded-full w-5 h-5 flex items-center justify-center font-bold">
+                {aliasCount > 99 ? '99+' : aliasCount}
+              </span>
+            )}
           </button>
           <button onClick={onReset}
             className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg font-medium text-sm">
@@ -1140,6 +1373,222 @@ function DetailTab({ data, year, activeProcesses, processStats, processInfo, isI
       <div>
         <h2 className="text-xl font-bold text-gray-800 mb-3">📊 유형별 월별 집계표</h2>
         <MonthlyTypeTable data={data} year={year} activeProcesses={activeProcesses} isIncluded={isIncluded} />
+      </div>
+    </div>
+  );
+}
+
+// ─────────── CONFIG MODAL ───────────
+// ─────────── PART ALIAS MODAL (partno → 품명) ───────────
+function PartAliasModal({ rawData, alias, onChange, onClose }) {
+  const [local, setLocal] = useState(alias);
+  const [search, setSearch] = useState('');
+  const [showOnlyUnmapped, setShowOnlyUnmapped] = useState(false);
+  const [bulkMode, setBulkMode] = useState(false);
+  const [bulkText, setBulkText] = useState('');
+  
+  useEffect(() => { setLocal(alias); }, [alias]);
+  
+  // 데이터에 등장하는 partno 자동 추출 (사용 빈도 정보 포함)
+  const allPartnos = useMemo(() => {
+    if (!rawData) return [];
+    const counts = {};
+    [...rawData.good, ...rawData.defect, ...rawData.rework].forEach(r => {
+      if (r.part) counts[r.part] = (counts[r.part] || 0) + 1;
+    });
+    return Object.entries(counts).map(([p, n]) => ({ partno: p, count: n })).sort((a, b) => b.count - a.count);
+  }, [rawData]);
+  
+  // 매핑된 항목 + 데이터 항목 통합
+  const allEntries = useMemo(() => {
+    const m = new Map();
+    allPartnos.forEach(({ partno, count }) => m.set(partno, count));
+    Object.keys(local).forEach(p => { if (!m.has(p)) m.set(p, 0); });
+    return [...m.entries()].map(([partno, count]) => ({ partno, count })).sort((a, b) => b.count - a.count);
+  }, [allPartnos, local]);
+  
+  const filtered = useMemo(() => {
+    return allEntries.filter(({ partno }) => {
+      if (showOnlyUnmapped && local[partno]) return false;
+      if (search) {
+        const q = search.toLowerCase();
+        if (!partno.toLowerCase().includes(q) && !((local[partno] || '').toLowerCase().includes(q))) return false;
+      }
+      return true;
+    });
+  }, [allEntries, search, showOnlyUnmapped, local]);
+  
+  const update = (next) => { setLocal(next); onChange(next); };
+  
+  const setMap = (partno, name) => {
+    const next = { ...local };
+    if (name && name.trim()) next[partno] = name.trim();
+    else delete next[partno];
+    update(next);
+  };
+  
+  const clearAll = () => {
+    if (!confirm('모든 품명 매핑을 삭제합니다. 계속하시겠습니까?')) return;
+    update({});
+  };
+  
+  const handleExport = () => {
+    const blob = new Blob([JSON.stringify(local, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `mfg-ftfr-part-alias-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  
+  const handleImport = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = JSON.parse(e.target.result);
+        if (typeof parsed !== 'object' || parsed === null) throw new Error('형식 오류');
+        update({ ...local, ...parsed });
+        alert(`품명 매핑 가져오기 완료: ${Object.keys(parsed).length}개 항목 (병합)`);
+      } catch {
+        alert('JSON 파일 형식 오류');
+      }
+    };
+    reader.readAsText(file);
+  };
+  
+  const applyBulk = () => {
+    // 형식: "partno → 품명" 또는 "partno = 품명" 또는 "partno\t품명" 라인별로
+    const lines = bulkText.split(/\r?\n/).filter(l => l.trim());
+    const next = { ...local };
+    let added = 0, removed = 0;
+    for (const line of lines) {
+      const m = line.match(/^\s*([^\s=→\t]+)\s*[=→\t]\s*(.+?)\s*$/);
+      if (m) {
+        const [, partno, name] = m;
+        if (name) { next[partno] = name; added++; }
+        else { delete next[partno]; removed++; }
+      }
+    }
+    update(next);
+    alert(`일괄 적용: ${added}개 추가/수정, ${removed}개 삭제`);
+    setBulkText('');
+    setBulkMode(false);
+  };
+  
+  const totalMapped = Object.keys(local).length;
+  const totalInData = allPartnos.length;
+  const mappedInData = allPartnos.filter(({ partno }) => local[partno]).length;
+  
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-xl shadow-2xl max-w-4xl w-full max-h-[92vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="p-5 bg-gradient-to-r from-blue-600 to-cyan-600 text-white rounded-t-xl flex items-center justify-between">
+          <div>
+            <h2 className="text-2xl font-bold">🏷️ 품명 매핑</h2>
+            <p className="text-sm text-blue-100 mt-1">
+              partno → 품명 (예: <span className="font-mono bg-white/20 px-1 rounded">ED-19729-3-F1 → HM</span>) · 변경 즉시 자동저장
+            </p>
+          </div>
+          <button onClick={onClose} className="text-3xl hover:bg-white hover:bg-opacity-20 rounded-lg w-10 h-10 flex items-center justify-center">×</button>
+        </div>
+        
+        {/* 액션 바 */}
+        <div className="px-5 py-3 bg-gray-100 border-b flex items-center gap-2 flex-wrap">
+          <input type="text" placeholder="🔍 partno/품명 검색..." 
+            value={search} onChange={(e) => setSearch(e.target.value)}
+            className="flex-1 min-w-[200px] px-3 py-1.5 border rounded text-sm" />
+          <label className="flex items-center gap-1 text-sm cursor-pointer bg-white px-2 py-1 rounded border">
+            <input type="checkbox" checked={showOnlyUnmapped} onChange={(e) => setShowOnlyUnmapped(e.target.checked)} />
+            미매핑만
+          </label>
+          <button onClick={() => setBulkMode(!bulkMode)} 
+            className={`px-3 py-1.5 rounded text-sm font-medium ${bulkMode ? 'bg-amber-500 text-white' : 'bg-amber-100 text-amber-700 hover:bg-amber-200'}`}>
+            ✏️ 일괄 입력
+          </button>
+          <button onClick={handleExport} className="px-3 py-1.5 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded text-sm font-medium">
+            📤 내보내기
+          </button>
+          <label className="px-3 py-1.5 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded text-sm font-medium cursor-pointer">
+            📥 가져오기
+            <input type="file" accept=".json" className="hidden" onChange={(e) => {
+              if (e.target.files[0]) handleImport(e.target.files[0]);
+              e.target.value = '';
+            }} />
+          </label>
+          <button onClick={clearAll} className="px-3 py-1.5 bg-red-100 hover:bg-red-200 text-red-700 rounded text-sm font-medium">
+            🗑️ 초기화
+          </button>
+        </div>
+        
+        {/* 일괄 입력 영역 */}
+        {bulkMode && (
+          <div className="p-4 bg-amber-50 border-b">
+            <div className="text-sm font-bold text-amber-800 mb-2">한 줄에 하나씩 입력 (구분자: <code>→</code> 또는 <code>=</code> 또는 <code>탭</code>)</div>
+            <textarea
+              value={bulkText}
+              onChange={(e) => setBulkText(e.target.value)}
+              placeholder={`ED-19729-3-F1 → HM\nED-14188-3D = B80C\nED-14164-1K\tFRONT`}
+              className="w-full h-32 px-3 py-2 border rounded text-sm font-mono"
+            />
+            <div className="mt-2 flex gap-2">
+              <button onClick={applyBulk}
+                className="px-4 py-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded text-sm font-bold">
+                ✅ 일괄 적용
+              </button>
+              <button onClick={() => { setBulkText(''); setBulkMode(false); }}
+                className="px-4 py-1.5 bg-gray-200 hover:bg-gray-300 rounded text-sm">
+                취소
+              </button>
+            </div>
+          </div>
+        )}
+        
+        {/* 매핑 테이블 */}
+        <div className="overflow-y-auto flex-1">
+          <table className="min-w-full text-sm">
+            <thead className="bg-gray-50 border-b sticky top-0 z-10">
+              <tr>
+                <th className="px-3 py-2 text-left font-bold text-gray-700 w-1/2">PartNo (raw)</th>
+                <th className="px-3 py-2 text-left font-bold text-gray-700 w-1/2">품명 → 표시될 이름</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {filtered.map(({ partno, count }) => (
+                <tr key={partno} className="hover:bg-blue-50">
+                  <td className="px-3 py-1.5">
+                    <div className="font-mono text-xs text-gray-700">{partno}</div>
+                    {count > 0 ? (
+                      <div className="text-[10px] text-gray-400">데이터 {count}건</div>
+                    ) : (
+                      <div className="text-[10px] text-amber-600">⚠ 데이터에 없음 (수동 입력 항목)</div>
+                    )}
+                  </td>
+                  <td className="px-3 py-1">
+                    <input type="text" 
+                      value={local[partno] || ''} 
+                      onChange={(e) => setMap(partno, e.target.value)}
+                      placeholder="(비우면 partno 그대로 표시)"
+                      className={`w-full px-2 py-1 border rounded text-sm ${local[partno] ? 'bg-blue-50 border-blue-300 font-bold' : 'bg-white'}`} />
+                  </td>
+                </tr>
+              ))}
+              {filtered.length === 0 && (
+                <tr><td colSpan="2" className="text-center text-gray-400 py-8">
+                  {!rawData ? '데이터를 먼저 업로드해주세요.' : (search || showOnlyUnmapped ? '검색/필터 결과 없음' : 'partno 없음')}
+                </td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        
+        {/* 풋터 */}
+        <div className="p-3 border-t bg-gray-50 rounded-b-xl flex justify-between items-center">
+          <div className="text-xs text-gray-500">
+            데이터 partno: <b>{totalInData}</b>개 · 매핑됨: <b className="text-blue-700">{mappedInData}</b>개 · 전체 매핑: <b>{totalMapped}</b>개
+          </div>
+          <button onClick={onClose} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold">완료</button>
+        </div>
       </div>
     </div>
   );
