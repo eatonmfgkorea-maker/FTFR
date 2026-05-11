@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>MFG FTFR 분석 V012</title>
+<title>MFG FTFR 분석 V014</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
@@ -31,9 +31,9 @@
 <script type="text/babel">
 const { useState, useEffect, useMemo, useCallback } = React;
 
-const STORAGE_KEY = 'mfg_ftfr_config_v5';
+const STORAGE_KEY = 'mfg_ftfr_config_v6';
 const ALIAS_KEY = 'mfg_ftfr_part_alias';
-const APP_VERSION = 'V012';
+const APP_VERSION = 'V014';
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const LINE_GROUPS = ['TCP', 'FE'];
 
@@ -57,7 +57,7 @@ const PRESET_CONFIG = {
   '2PC': {
     lineNames: ['ELD 2PC'],
     reworkStations: ['Perfomance Test & Lot No Marking'],
-    defectStations: ["Case Ass'y& Back Parts Ass'y", 'Perfomance Test & Lot No Marking', 'Runout Gaging& Final Inspection']
+    defectStations: ['Perfomance Test & Lot No Marking']
   },
   'Nospin': {
     lineNames: ['Nospin'],
@@ -70,19 +70,16 @@ const PRESET_CONFIG = {
     defectStations: ['Final Test']
   },
   'A/FLVV': {
-    lineNames: ['Auto FLVV'],
+    lineNames: ['Auto FLVV', 'FLVV', 'FLVV SUB', 'New FLVV'],
     reworkStations: ['Final Test'],
-    defectStations: ['Final Test']
+    defectStations: ['Final Test'],
+    reworkTypes: ['Leak', 'Flow', 'LEAK', 'FLOW'],
+    defectTypes: ['Leak', 'Flow', 'LEAK', 'FLOW']
   },
   'C/FLVV': {
     lineNames: ['COMBO FLVV'],
     reworkStations: ['Final Test'],
-    defectStations: ['Final Test', 'Sub Assembly']
-  },
-  'M/FLVV': {
-    lineNames: ['FLVV'],
-    reworkStations: ["Final Ass'y & Leak Test"],
-    defectStations: ["Final Ass'y & Leak Test"]
+    defectStations: ['Final Test']
   },
   'M/GVV': {
     lineNames: ['Manual GVV'],
@@ -172,8 +169,8 @@ const FE_LINE_MAP = {
   'Auto GVV': 'A/GVV', 'AUTO GVV': 'A/GVV',
   'Manual GVV': 'M/GVV',
   'Auto FLVV': 'A/FLVV', 'New FLVV': 'A/FLVV',
+  'FLVV': 'A/FLVV', 'FLVV SUB': 'A/FLVV',
   'COMBO FLVV': 'C/FLVV',
-  'FLVV': 'M/FLVV', 'FLVV SUB': 'M/FLVV',
   'LVS': 'LVS', 'FTIV': 'FTIV', 'ICV': 'ICV', 'UCC': 'UCC',
   'MEMBRANE': 'MEM'
 };
@@ -259,6 +256,9 @@ const parseMdbBuffer = async (buffer, fileName) => {
   for (const r of def) {
     const date = toDate(r['일자']);
     if (!date) continue;
+    // 엑셀과 동일: '판정불가'만 2차불량(폐기)으로 집계
+    const gubun = String(r['불량구분'] || '').trim();
+    if (gubun !== '판정불가') continue;
     const lineName = String(r['라인명'] || '').trim();
     const process = mapLineToProcess(side, lineName);
     if (!process) continue;
@@ -267,6 +267,7 @@ const parseMdbBuffer = async (buffer, fileName) => {
       part: String(r['PARTNO'] || '').trim(),
       station: String(r['STATION'] || '').trim(),
       type: String(r['유형'] || '').trim(),
+      gubun,
       qty: Number(r['수량'] || 0)
     });
   }
@@ -352,7 +353,12 @@ const serializeRaw = (raw) => {
 };
 
 const deserializeRaw = (json) => {
-  const conv = (arr) => (arr || []).map(r => ({ ...r, date: r.date ? new Date(r.date) : null }));
+  // 새 FE_LINE_MAP/TCP_LINE_MAP 규칙으로 process 재매핑 (기존 JSON도 호환)
+  const conv = (arr) => (arr || []).map(r => {
+    const date = r.date ? new Date(r.date) : null;
+    const remapped = (r.line && r.lineName) ? mapLineToProcess(r.line, r.lineName) : null;
+    return { ...r, date, process: remapped || r.process };
+  });
   return {
     good: conv(json.good),
     defect: conv(json.defect),
@@ -638,18 +644,26 @@ function App() {
     return processes.filter(p => processInfo[p]?.line === lineFilter);
   }, [processes, processInfo, lineFilter]);
   
-  const isIncluded = useCallback((process, lineName, station, kind) => {
+  const isIncluded = useCallback((process, lineName, station, type, kind) => {
     const c = config[process];
     if (!c) return true;
     // 라인명 필터 (모든 kind 공통)
     if (c.lineNames && c.lineNames.length > 0 && !c.lineNames.includes(lineName)) return false;
-    // 양품(good)은 STATION 필터 무시
+    // 양품(good)은 STATION/유형 필터 무시
     if (kind === 'good') return true;
     // STATION 필터
-    const key = kind === 'rework' ? 'reworkStations' : 'defectStations';
-    const sel = c[key];
-    if (!sel || sel.length === 0) return true;
-    return sel.includes(station);
+    const stationKey = kind === 'rework' ? 'reworkStations' : 'defectStations';
+    const stationSel = c[stationKey];
+    if (stationSel && stationSel.length > 0 && !stationSel.includes(station)) return false;
+    // 유형(TYPE) 필터 (엑셀 A/FLVV 등에서 사용)
+    const typeKey = kind === 'rework' ? 'reworkTypes' : 'defectTypes';
+    const typeSel = c[typeKey];
+    if (typeSel && typeSel.length > 0) {
+      const t = (type || '').toLowerCase();
+      const match = typeSel.some(x => String(x).toLowerCase() === t);
+      if (!match) return false;
+    }
+    return true;
   }, [config]);
   
   const processStats = useMemo(() => {
@@ -666,19 +680,19 @@ function App() {
     data.good.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!result[r.process]) return;
-      if (!isIncluded(r.process, r.lineName, null, 'good')) return;
+      if (!isIncluded(r.process, r.lineName, null, null, 'good')) return;
       result[r.process].good[r.date.getMonth()] += r.qty;
     });
     data.defect.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!result[r.process]) return;
-      if (!isIncluded(r.process, r.lineName, r.station, 'defect')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'defect')) return;
       result[r.process].defect[r.date.getMonth()] += r.qty;
     });
     data.rework.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!result[r.process]) return;
-      if (!isIncluded(r.process, r.lineName, r.station, 'rework')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'rework')) return;
       result[r.process].rework[r.date.getMonth()] += r.qty;
     });
     return result;
@@ -1078,7 +1092,7 @@ function TopBottomCard({ data, year, activeProcesses, isIncluded }) {
     data.good.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
-      if (!isIncluded(r.process, r.lineName, null, 'good')) return;
+      if (!isIncluded(r.process, r.lineName, null, null, 'good')) return;
       const k = key(r);
       if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
       m[k].good += r.qty;
@@ -1086,7 +1100,7 @@ function TopBottomCard({ data, year, activeProcesses, isIncluded }) {
     data.defect.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
-      if (!isIncluded(r.process, r.lineName, r.station, 'defect')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'defect')) return;
       const k = key(r);
       if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
       m[k].defect += r.qty;
@@ -1094,12 +1108,12 @@ function TopBottomCard({ data, year, activeProcesses, isIncluded }) {
     data.rework.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
-      if (!isIncluded(r.process, r.lineName, r.station, 'rework')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'rework')) return;
       const k = key(r);
       if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
       m[k].rework += r.qty;
     });
-    
+
     return Object.values(m).map(s => {
       const input = s.good + s.defect;
       const ftfr = input > 0 ? (s.rework / input) * 1000000 : null;
@@ -1261,13 +1275,13 @@ function PartTable({ data, year, process, processInfo, isIncluded }) {
     data.good.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (r.process !== process || !m[r.part]) return;
-      if (!isIncluded(r.process, r.lineName, null, 'good')) return;
+      if (!isIncluded(r.process, r.lineName, null, null, 'good')) return;
       m[r.part].good += r.qty;
     });
     data.defect.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (r.process !== process || !m[r.part]) return;
-      if (!isIncluded(r.process, r.lineName, r.station, 'defect')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'defect')) return;
       m[r.part].defect += r.qty;
       const t = r.type || '(미분류)';
       m[r.part].defectTypes[t] = (m[r.part].defectTypes[t] || 0) + r.qty;
@@ -1275,7 +1289,7 @@ function PartTable({ data, year, process, processInfo, isIncluded }) {
     data.rework.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (r.process !== process || !m[r.part]) return;
-      if (!isIncluded(r.process, r.lineName, r.station, 'rework')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'rework')) return;
       m[r.part].rework += r.qty;
       const t = r.type || '(미분류)';
       m[r.part].reworkTypes[t] = (m[r.part].reworkTypes[t] || 0) + r.qty;
@@ -1427,7 +1441,7 @@ function MonthlyTypeTable({ data, year, activeProcesses, isIncluded }) {
     rows.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
-      if (!isIncluded(r.process, r.lineName, r.station, kind)) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, kind)) return;
       const t = r.type || '(미분류)';
       if (!m[t]) m[t] = Array(12).fill(0);
       m[t][r.date.getMonth()] += r.qty;
