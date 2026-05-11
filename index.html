@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>MFG FTFR 분석 V011</title>
+<title>MFG FTFR 분석 V012</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
@@ -33,7 +33,7 @@ const { useState, useEffect, useMemo, useCallback } = React;
 
 const STORAGE_KEY = 'mfg_ftfr_config_v5';
 const ALIAS_KEY = 'mfg_ftfr_part_alias';
-const APP_VERSION = 'V011';
+const APP_VERSION = 'V012';
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const LINE_GROUPS = ['TCP', 'FE'];
 
@@ -212,7 +212,12 @@ const waitForMdbReader = () => new Promise((resolve, reject) => {
 const parseMdbFile = async (file) => {
   await waitForMdbReader();
   const buf = await file.arrayBuffer();
-  const reader = new window.MDBReader(window.Buffer.from(buf));
+  return parseMdbBuffer(buf, file.name);
+};
+
+const parseMdbBuffer = async (buffer, fileName) => {
+  await waitForMdbReader();
+  const reader = new window.MDBReader(window.Buffer.from(buffer));
   
   const tables = reader.getTableNames();
   const required = ['양품수량', '불량정보', '불량재작업'];
@@ -226,7 +231,6 @@ const parseMdbFile = async (file) => {
   const def = reader.getTable('불량정보').getData();
   const rw = reader.getTable('불량재작업').getData();
   
-  // TCP/FE 자동 판별
   const side = detectSide(yp);
   if (!side) throw new Error('TCP/FE 라인 판별 실패. 라인명을 확인하세요.');
   
@@ -283,7 +287,80 @@ const parseMdbFile = async (file) => {
     });
   }
   
-  return { good, defect, rework, side };
+  return { good, defect, rework, side, fileName, buffer };
+};
+
+// ─────────── Google Drive 자동 동기화 (GAS endpoint 재사용) ───────────
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbwRZ3A_nvX_-olruOEg_7bja79JUs0FlG7BupuGsPbfOsIIpNJ3YYhd-B_B0MaTsiW6Iw/exec';
+const FTFR_FILE_PREFIX = 'mfg-ftfr-data';
+
+const driveSave = async (payload) => {
+  const filename = `${FTFR_FILE_PREFIX}.json`;
+  const res = await fetch(GAS_URL, {
+    method: 'POST',
+    body: JSON.stringify({ filename, data: payload })
+  });
+  const j = await res.json();
+  if (!j.ok) throw new Error(j.error || 'save failed');
+  return j; // {ok, id, name}
+};
+
+const driveListFtfr = async () => {
+  const res = await fetch(`${GAS_URL}?action=list`);
+  const j = await res.json();
+  if (!j.ok) throw new Error(j.error || 'list failed');
+  return (j.files || []).filter(f => f.name.startsWith(FTFR_FILE_PREFIX));
+};
+
+const driveLoadById = async (id) => {
+  const res = await fetch(`${GAS_URL}?action=load&id=${encodeURIComponent(id)}`);
+  const j = await res.json();
+  if (!j.ok) throw new Error(j.error || 'load failed');
+  return j.data;
+};
+
+const driveDelete = async (id) => {
+  const res = await fetch(`${GAS_URL}?action=delete&id=${encodeURIComponent(id)}`);
+  return res.json();
+};
+
+// 최신 1개만 남기고 모두 정리 (GAS는 동일 파일명도 매번 새로 생성하므로 누적됨)
+const driveCleanupOldFtfr = async (keepId) => {
+  try {
+    const files = await driveListFtfr();
+    for (const f of files) {
+      if (f.id !== keepId) {
+        await driveDelete(f.id);
+      }
+    }
+  } catch (e) {
+    console.warn('cleanup failed:', e);
+  }
+};
+
+// rawData ↔ JSON 직렬화 (Date 객체 변환)
+const serializeRaw = (raw) => {
+  const conv = (arr) => arr.map(r => ({ ...r, date: r.date instanceof Date ? r.date.toISOString() : r.date }));
+  return {
+    good: conv(raw.good),
+    defect: conv(raw.defect),
+    rework: conv(raw.rework),
+    fileName: raw.fileName,
+    source: raw.source,
+    savedAt: new Date().toISOString()
+  };
+};
+
+const deserializeRaw = (json) => {
+  const conv = (arr) => (arr || []).map(r => ({ ...r, date: r.date ? new Date(r.date) : null }));
+  return {
+    good: conv(json.good),
+    defect: conv(json.defect),
+    rework: conv(json.rework),
+    fileName: json.fileName || '',
+    source: json.source || 'mdb',
+    savedAt: json.savedAt
+  };
 };
 
 // ─────────── FILE UPLOAD ───────────
@@ -357,8 +434,7 @@ function FileUpload({ onLoad }) {
         // MDB 모드 (1~2개 파일, TCP+FE)
         setProgress(`MDB 라이브러리 로드 중... (${mdbFiles.length}개 파일)`);
         const merged = { good: [], defect: [], rework: [] };
-        const sides = [];
-        const fileNames = [];
+        const sidesInfo = [];
         
         for (let i = 0; i < mdbFiles.length; i++) {
           const f = mdbFiles[i];
@@ -367,12 +443,28 @@ function FileUpload({ onLoad }) {
           merged.good.push(...parsed.good);
           merged.defect.push(...parsed.defect);
           merged.rework.push(...parsed.rework);
-          sides.push(parsed.side);
-          fileNames.push(`${f.name} → ${parsed.side}`);
+          sidesInfo.push({ side: parsed.side, fileName: f.name });
           setProgress(`[${i+1}/${mdbFiles.length}] ${parsed.side}: 양품 ${parsed.good.length.toLocaleString()} / 불량 ${parsed.defect.length.toLocaleString()} / 재작업 ${parsed.rework.length.toLocaleString()}`);
         }
         
-        onLoad({ ...merged, fileName: fileNames.join(', '), source: 'mdb' });
+        const fileNames = sidesInfo.map(s => `${s.fileName} → ${s.side}`).join(', ');
+        const result = { ...merged, fileName: fileNames, source: 'mdb' };
+        
+        // 공유폴더 자동 저장 + 이전 파일 정리
+        setProgress('☁️ 공유폴더에 저장 중...');
+        try {
+          const payload = serializeRaw(result);
+          const saved = await driveSave(payload);
+          setProgress(`☁️ 저장 완료, 이전 파일 정리 중...`);
+          await driveCleanupOldFtfr(saved.id);
+          result.savedAt = payload.savedAt;
+          result.driveFileId = saved.id;
+        } catch (e) {
+          console.warn('공유폴더 저장 실패:', e);
+          alert('공유폴더 저장에 실패했어요 (네트워크 문제일 수 있음). 데이터는 화면에 표시되지만, 다음에 앱을 열면 다시 업로드해야 해요.\n\n' + e.message);
+        }
+        
+        onLoad(result);
       } else {
         throw new Error('지원되는 파일 형식: .xlsx / .mdb / .accdb');
       }
@@ -443,6 +535,36 @@ function App() {
   const [showConfig, setShowConfig] = useState(false);
   const [partAlias, setPartAlias] = useState(loadAlias);
   const [showAlias, setShowAlias] = useState(false);
+  const [autoLoading, setAutoLoading] = useState(true);
+  const [autoLoadMsg, setAutoLoadMsg] = useState('');
+  const [driveInfo, setDriveInfo] = useState(null); // {fileId, name, modified, savedAt}
+  
+  // 앱 시작 시 Google Drive에서 최신 ftfr 파일 자동 로드
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        setAutoLoadMsg('공유폴더 확인 중...');
+        const files = await driveListFtfr();
+        if (cancelled) return;
+        if (files.length === 0) { setAutoLoading(false); return; }
+        
+        const latest = files[0]; // modified desc 정렬됨
+        setAutoLoadMsg(`최신 데이터 로드 중... (${latest.name})`);
+        const json = await driveLoadById(latest.id);
+        if (cancelled) return;
+        
+        const parsed = deserializeRaw(json);
+        setRawData({ ...parsed, fromCache: true, driveFileId: latest.id });
+        setDriveInfo({ fileId: latest.id, name: latest.name, modified: latest.modified, savedAt: parsed.savedAt });
+      } catch (e) {
+        console.warn('공유폴더 자동 로드 실패:', e);
+      } finally {
+        if (!cancelled) setAutoLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
   
   // partno → 품명 매핑 적용된 data (모든 자식 useMemo가 이걸 사용)
   const data = useMemo(() => {
@@ -570,6 +692,18 @@ function App() {
     });
   }, [filteredProcesses, processStats]);
   
+  if (autoLoading) {
+    return (
+      <div className="min-h-screen p-6 flex items-center justify-center">
+        <div className="bg-white rounded-xl shadow-xl p-10 text-center max-w-md">
+          <div className="text-5xl mb-4 animate-pulse">☁️</div>
+          <div className="text-xl font-bold text-gray-800 mb-2">공유폴더 동기화 중...</div>
+          <div className="text-sm text-gray-500">{autoLoadMsg || '이전에 저장된 데이터를 확인하고 있어요'}</div>
+        </div>
+      </div>
+    );
+  }
+  
   if (!data) {
     return (
       <div className="min-h-screen p-6">
@@ -577,7 +711,10 @@ function App() {
           <h1 className="text-3xl font-bold text-gray-800 mb-6">
             📈 MFG FTFR 분석 <span className="text-sm text-gray-400 font-normal ml-2">{APP_VERSION}</span>
           </h1>
-          <FileUpload onLoad={setRawData} />
+          <FileUpload onLoad={(d) => {
+            setRawData(d);
+            if (d.driveFileId) setDriveInfo({ fileId: d.driveFileId, name: `${FTFR_FILE_PREFIX}.json`, modified: d.savedAt, savedAt: d.savedAt });
+          }} />
         </div>
       </div>
     );
@@ -592,6 +729,20 @@ function App() {
           onShowConfig={() => setShowConfig(true)}
           onShowAlias={() => setShowAlias(true)}
           aliasCount={Object.keys(partAlias).length}
+          driveInfo={driveInfo}
+          onClearDrive={async () => {
+            if (!confirm('공유폴더에 저장된 모든 ftfr 파일을 삭제합니다. 계속하시겠습니까?')) return;
+            try {
+              const files = await driveListFtfr();
+              for (const f of files) await driveDelete(f.id);
+              setDriveInfo(null);
+              setRawData(null);
+              setYear(null);
+              alert('공유폴더 파일이 모두 삭제되었습니다.');
+            } catch (e) {
+              alert('삭제 실패: ' + e.message);
+            }
+          }}
           onReset={() => { setRawData(null); setYear(null); }} />
         
         {tab === 'main' && (
@@ -624,7 +775,18 @@ function App() {
 }
 
 // ─────────── HEADER ───────────
-function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter, tab, setTab, onShowConfig, onShowAlias, aliasCount, onReset }) {
+function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter, tab, setTab, onShowConfig, onShowAlias, aliasCount, driveInfo, onClearDrive, onReset }) {
+  const driveText = driveInfo
+    ? (() => {
+        const ts = driveInfo.savedAt || driveInfo.modified;
+        if (!ts) return '저장됨';
+        const ago = Math.floor((Date.now() - new Date(ts).getTime()) / 60000); // 분
+        if (ago < 1) return '방금 전 저장';
+        if (ago < 60) return `${ago}분 전 저장`;
+        if (ago < 1440) return `${Math.floor(ago / 60)}시간 전 저장`;
+        return `${Math.floor(ago / 1440)}일 전 저장`;
+      })()
+    : null;
   return (
     <div className="mb-6">
       <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
@@ -636,8 +798,14 @@ function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter
             <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold mr-2 ${data.source === 'mdb' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
               {data.source === 'mdb' ? '🗃️ MDB' : '📄 XLSX'}
             </span>
+            {data.fromCache && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded font-bold mr-2 bg-amber-100 text-amber-700">☁️ 공유폴더</span>
+            )}
             📁 {data.fileName} · 양품 {data.good.length.toLocaleString()}행 · 불량 {data.defect.length.toLocaleString()}행 · 재작업 {data.rework.length.toLocaleString()}행
           </div>
+          {driveText && (
+            <div className="text-[11px] text-gray-400 mt-0.5">☁️ 공유폴더 · {driveText}</div>
+          )}
         </div>
         <div className="flex gap-2 items-center flex-wrap">
           <select value={year || ''} onChange={(e) => setYear(Number(e.target.value))}
@@ -669,6 +837,12 @@ function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter
             className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg font-medium text-sm">
             🔄 다시 업로드
           </button>
+          {driveInfo && (
+            <button onClick={onClearDrive}
+              className="px-3 py-2 bg-red-50 hover:bg-red-100 text-red-700 rounded-lg font-medium text-sm">
+              ☁️ 공유폴더 정리
+            </button>
+          )}
         </div>
       </div>
       <div className="flex gap-1 border-b border-gray-200">
