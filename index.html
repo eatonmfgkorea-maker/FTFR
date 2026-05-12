@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<title>MFG FTFR 분석 V018</title>
+<title>MFG FTFR 분석 V022</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
@@ -31,9 +31,9 @@
 <script type="text/babel">
 const { useState, useEffect, useMemo, useCallback } = React;
 
-const STORAGE_KEY = 'mfg_ftfr_config_v8';
+const STORAGE_KEY = 'mfg_ftfr_config_v9';
 const ALIAS_KEY = 'mfg_ftfr_part_alias';
-const APP_VERSION = 'V018';
+const APP_VERSION = 'V022';
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const LINE_GROUPS = ['TCP', 'FE'];
 
@@ -52,12 +52,14 @@ const PRESET_CONFIG = {
   '1PC': {
     lineNames: ['LD 1PC'],
     reworkStations: [],
-    defectStations: []
+    defectStations: [],
+    scrapGubun: ['작업자']
   },
   '2PC': {
     lineNames: ['ELD 2PC'],
     reworkStations: ['Perfomance Test & Lot No Marking'],
-    defectStations: ['Perfomance Test & Lot No Marking']
+    defectStations: ['Perfomance Test & Lot No Marking'],
+    scrapGubun: ['작업자']
   },
   'Nospin': {
     lineNames: ['Nospin'],
@@ -176,6 +178,31 @@ const FE_LINE_MAP = {
 };
 const FE_EXCLUDE = new Set(['ATV M/C', 'UMBRELLA M/C', 'FLVV SUB']);
 
+// ─── Scorecard 표시 매핑 (분석본 양식 그대로) ───
+const PROCESS_DISPLAY = {
+  '1PC': 'LD 1PC', '2PC': 'ELD 2PCS', 'Nospin': 'Nospin',
+  'ICV': 'ICV', 'A/GVV': 'Auto GVV', 'M/GVV': 'Manual GVV',
+  'C/FLVV': 'Combo FLVV', 'A/FLVV': 'Auto FLVV', 'MEM': 'Membrane',
+  'LVS': 'LVS', 'UCC': 'UCC', 'FTIV': 'FTIV'
+};
+const SCORECARD_GROUPS = [
+  { key: 'TCP',  label: 'TCP',  processes: ['1PC', '2PC', 'Nospin'] },
+  { key: 'FE',   label: 'FE',   processes: ['ICV', 'A/GVV', 'M/GVV', 'C/FLVV', 'A/FLVV', 'MEM', 'LVS', 'UCC'] },
+  { key: 'FTIV', label: 'FTIV', processes: ['FTIV'] }
+];
+
+// Part(품명)별 FTFR 탭 — 분석본의 ICV/FLVV/LVS/AGVV/MGVV/UCC/FTIV/TCP 시트
+const PROCESS_TABS = [
+  { key: 'ICV',  label: 'ICV',  processes: ['ICV'] },
+  { key: 'FLVV', label: 'FLVV', processes: ['A/FLVV', 'C/FLVV'] },
+  { key: 'LVS',  label: 'LVS',  processes: ['LVS'] },
+  { key: 'AGVV', label: 'AGVV', processes: ['A/GVV'] },
+  { key: 'MGVV', label: 'MGVV', processes: ['M/GVV', 'MEM'] },
+  { key: 'UCC',  label: 'UCC',  processes: ['UCC'] },
+  { key: 'FTIV', label: 'FTIV', processes: ['FTIV'] },
+  { key: 'TCP',  label: 'TCP',  processes: ['1PC', '2PC', 'Nospin'] }
+];
+
 const mapLineToProcess = (side, raw) => {
   if (raw == null) return null;
   const s = String(raw).trim();
@@ -256,9 +283,7 @@ const parseMdbBuffer = async (buffer, fileName) => {
   for (const r of def) {
     const date = toDate(r['일자']);
     if (!date) continue;
-    // 엑셀과 동일: '판정불가'만 2차불량(폐기)으로 집계
     const gubun = String(r['불량구분'] || '').trim();
-    if (gubun !== '판정불가') continue;
     const lineName = String(r['라인명'] || '').trim();
     const process = mapLineToProcess(side, lineName);
     if (!process) continue;
@@ -339,8 +364,8 @@ const driveCleanupOldFtfr = async (keepId) => {
   }
 };
 
-// rawData ↔ JSON 직렬화 (Date 객체 변환)
-const serializeRaw = (raw) => {
+// rawData ↔ JSON 직렬화 (Date 객체 변환 + partAlias 포함)
+const serializeRaw = (raw, partAlias) => {
   const conv = (arr) => arr.map(r => ({ ...r, date: r.date instanceof Date ? r.date.toISOString() : r.date }));
   return {
     good: conv(raw.good),
@@ -348,6 +373,7 @@ const serializeRaw = (raw) => {
     rework: conv(raw.rework),
     fileName: raw.fileName,
     source: raw.source,
+    partAlias: partAlias || {},
     savedAt: new Date().toISOString()
   };
 };
@@ -365,12 +391,13 @@ const deserializeRaw = (json) => {
     rework: conv(json.rework),
     fileName: json.fileName || '',
     source: json.source || 'mdb',
+    partAlias: json.partAlias || {},
     savedAt: json.savedAt
   };
 };
 
 // ─────────── FILE UPLOAD ───────────
-function FileUpload({ onLoad }) {
+function FileUpload({ onLoad, partAlias }) {
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState('');
   const [error, setError] = useState('');
@@ -472,7 +499,7 @@ function FileUpload({ onLoad }) {
       // 공유폴더 자동 저장 + 이전 파일 정리
       setProgress('☁️ 공유폴더에 저장 중...');
       try {
-        const payload = serializeRaw(result);
+        const payload = serializeRaw(result, partAlias);
         const saved = await driveSave(payload);
         setProgress(`☁️ 저장 완료, 이전 파일 정리 중...`);
         await driveCleanupOldFtfr(saved.id);
@@ -629,6 +656,15 @@ function App() {
         const parsed = deserializeRaw(json);
         setRawData({ ...parsed, fromCache: true, driveFileId: latest.id });
         setDriveInfo({ fileId: latest.id, name: latest.name, modified: latest.modified, savedAt: parsed.savedAt });
+        
+        // 공유폴더 alias를 localStorage와 병합 (공유폴더 우선, localStorage에만 있는 키는 유지)
+        if (parsed.partAlias && Object.keys(parsed.partAlias).length > 0) {
+          setPartAlias(prev => {
+            const merged = { ...prev, ...parsed.partAlias };
+            saveAlias(merged);
+            return merged;
+          });
+        }
       } catch (e) {
         console.warn('공유폴더 자동 로드 실패:', e);
       } finally {
@@ -710,19 +746,42 @@ function App() {
     return processes.filter(p => processInfo[p]?.line === lineFilter);
   }, [processes, processInfo, lineFilter]);
   
-  const isIncluded = useCallback((process, lineName, station, type, kind) => {
+  const isIncluded = useCallback((process, lineName, station, type, kind, gubun) => {
     const c = config[process];
     if (!c) return true;
     // 라인명 필터 (모든 kind 공통)
     if (c.lineNames && c.lineNames.length > 0 && !c.lineNames.includes(lineName)) return false;
     // 양품(good)은 STATION/유형 필터 무시
     if (kind === 'good') return true;
+    
+    // 불량구분(gubun) 필터
+    // defect: '판정불가'만 카운트 (raw에 모든 gubun 들어있으므로 여기서 필터)
+    // scrap: PRESET의 scrapGubun (없으면 디폴트 '판정불가' = defect와 동일)
+    if (kind === 'defect') {
+      if (gubun !== undefined && gubun !== '' && gubun !== '판정불가') return false;
+    } else if (kind === 'scrap') {
+      const gs = c.scrapGubun;
+      if (gs && gs.length > 0) {
+        if (!gs.includes(gubun)) return false;
+      } else {
+        // 디폴트: 판정불가 (FE/FTIV)
+        if (gubun !== undefined && gubun !== '' && gubun !== '판정불가') return false;
+      }
+    }
+    
     // STATION 필터
-    const stationKey = kind === 'rework' ? 'reworkStations' : 'defectStations';
+    let stationKey;
+    if (kind === 'rework') stationKey = 'reworkStations';
+    else if (kind === 'scrap') stationKey = c.scrapStations !== undefined ? 'scrapStations' : 'defectStations';
+    else stationKey = 'defectStations';
     const stationSel = c[stationKey];
     if (stationSel && stationSel.length > 0 && !stationSel.includes(station)) return false;
-    // 유형(TYPE) 필터 (엑셀 A/FLVV 등에서 사용)
-    const typeKey = kind === 'rework' ? 'reworkTypes' : 'defectTypes';
+    
+    // 유형(TYPE) 필터
+    let typeKey;
+    if (kind === 'rework') typeKey = 'reworkTypes';
+    else if (kind === 'scrap') typeKey = c.scrapTypes !== undefined ? 'scrapTypes' : 'defectTypes';
+    else typeKey = 'defectTypes';
     const typeSel = c[typeKey];
     if (typeSel && typeSel.length > 0) {
       const t = (type || '').toLowerCase();
@@ -741,6 +800,7 @@ function App() {
         good: Array(12).fill(0),
         defect: Array(12).fill(0),
         rework: Array(12).fill(0),
+        scrap: Array(12).fill(0),
       };
     });
     data.good.forEach(r => {
@@ -749,11 +809,17 @@ function App() {
       if (!isIncluded(r.process, r.lineName, null, null, 'good')) return;
       result[r.process].good[r.date.getMonth()] += r.qty;
     });
+    // defect와 scrap은 같은 raw에서 다른 필터로 누적
     data.defect.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!result[r.process]) return;
-      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'defect')) return;
-      result[r.process].defect[r.date.getMonth()] += r.qty;
+      const month = r.date.getMonth();
+      if (isIncluded(r.process, r.lineName, r.station, r.type, 'defect', r.gubun)) {
+        result[r.process].defect[month] += r.qty;
+      }
+      if (isIncluded(r.process, r.lineName, r.station, r.type, 'scrap', r.gubun)) {
+        result[r.process].scrap[month] += r.qty;
+      }
     });
     data.rework.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
@@ -794,7 +860,7 @@ function App() {
           <FileUpload onLoad={(d) => {
             setRawData(d);
             if (d.driveFileId) setDriveInfo({ fileId: d.driveFileId, name: `${FTFR_FILE_PREFIX}.json`, modified: d.savedAt, savedAt: d.savedAt });
-          }} />
+          }} partAlias={partAlias} />
         </div>
       </div>
     );
@@ -835,6 +901,9 @@ function App() {
             processStats={processStats} processInfo={processInfo}
             isIncluded={isIncluded} lineFilter={lineFilter} />
         )}
+        {tab === 'scorecard' && (
+          <Scorecard data={data} year={year} isIncluded={isIncluded} />
+        )}
         
         {showConfig && (
           <ConfigModal processes={processes} processInfo={processInfo}
@@ -847,7 +916,21 @@ function App() {
           <PartAliasModal rawData={rawData}
             alias={partAlias}
             onChange={(a) => { setPartAlias(a); saveAlias(a); }}
-            onClose={() => setShowAlias(false)} />
+            onClose={async () => {
+              setShowAlias(false);
+              // 공유폴더에 alias 동기화 — 데이터가 이미 Drive에 있으면 alias만 갱신해서 재저장
+              if (rawData && rawData.driveFileId) {
+                try {
+                  const payload = serializeRaw(rawData, partAlias);
+                  const saved = await driveSave(payload);
+                  await driveCleanupOldFtfr(saved.id);
+                  setRawData(prev => ({ ...prev, driveFileId: saved.id, savedAt: payload.savedAt }));
+                  setDriveInfo({ fileId: saved.id, name: `${FTFR_FILE_PREFIX}.json`, modified: payload.savedAt, savedAt: payload.savedAt });
+                } catch (e) {
+                  console.warn('alias 공유폴더 동기화 실패:', e);
+                }
+              }
+            }} />
         )}
       </div>
     </div>
@@ -933,6 +1016,10 @@ function Header({ data, year, setYear, availableYears, lineFilter, setLineFilter
         <button onClick={() => setTab('detail')}
           className={`px-6 py-3 font-bold transition ${tab === 'detail' ? 'border-b-2 border-emerald-600 text-emerald-700 bg-emerald-50' : 'text-gray-500 hover:text-gray-700'}`}>
           📋 FTFR 세부
+        </button>
+        <button onClick={() => setTab('scorecard')}
+          className={`px-6 py-3 font-bold transition ${tab === 'scorecard' ? 'border-b-2 border-emerald-600 text-emerald-700 bg-emerald-50' : 'text-gray-500 hover:text-gray-700'}`}>
+          📑 Scorecard
         </button>
       </div>
     </div>
@@ -1166,7 +1253,7 @@ function TopBottomCard({ data, year, activeProcesses, isIncluded }) {
     data.defect.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
-      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'defect')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'defect', r.gubun)) return;
       const k = key(r);
       if (!m[k]) m[k] = { line: r.line, process: r.process, part: r.part || '(미분류)', good: 0, defect: 0, rework: 0 };
       m[k].defect += r.qty;
@@ -1258,10 +1345,11 @@ function MainTab({ year, data, activeProcesses, processStats, processInfo, isInc
 // ─────────── 공정별 월간 표 ───────────
 function ProcessMonthlyTable({ process, line, stats }) {
   if (!stats) return null;
-  const { good, defect, rework } = stats;
+  const { good, defect, rework, scrap } = stats;
+  const scrapArr = scrap || Array(12).fill(0);
   const input = good.map((g, i) => g + defect[i]);
   const ftfr = rework.map((r, i) => input[i] > 0 ? (r / input[i]) * 1000000 : null);
-  const goodYTD = sumArr(good), defectYTD = sumArr(defect), reworkYTD = sumArr(rework);
+  const goodYTD = sumArr(good), defectYTD = sumArr(defect), reworkYTD = sumArr(rework), scrapYTD = sumArr(scrapArr);
   const inputYTD = goodYTD + defectYTD;
   const ftfrYTD = inputYTD > 0 ? (reworkYTD / inputYTD) * 1000000 : null;
   const headerColor = line === 'TCP' ? 'from-blue-700 to-cyan-600' : 'from-purple-700 to-pink-600';
@@ -1293,7 +1381,7 @@ function ProcessMonthlyTable({ process, line, stats }) {
               <td className="px-3 py-2 text-right font-bold tabular-nums border-l-2 border-gray-300">{fmtNum(reworkYTD)}</td>
             </tr>
             <tr>
-              <td className="px-3 py-2 text-[10px] text-gray-500 whitespace-nowrap pl-4">2차불량 / scrap</td>
+              <td className="px-3 py-2 text-[10px] text-gray-500 whitespace-nowrap pl-4">2차불량 (판정불가)</td>
               <td className="px-3 py-2 font-bold text-gray-700 whitespace-nowrap">2차불량</td>
               {defect.map((v, i) => <td key={i} className="px-2 py-2 text-right tabular-nums">{v > 0 ? fmtNum(v) : '-'}</td>)}
               <td className="px-3 py-2 text-right font-bold tabular-nums border-l-2 border-gray-300">{fmtNum(defectYTD)}</td>
@@ -1309,6 +1397,12 @@ function ProcessMonthlyTable({ process, line, stats }) {
               <td className="px-3 py-2 font-bold text-gray-700 whitespace-nowrap">투입수량</td>
               {input.map((v, i) => <td key={i} className="px-2 py-2 text-right tabular-nums">{v > 0 ? fmtNum(v) : '-'}</td>)}
               <td className="px-3 py-2 text-right font-bold tabular-nums border-l-2 border-gray-300">{fmtNum(inputYTD)}</td>
+            </tr>
+            <tr className="bg-slate-50">
+              <td className="px-3 py-2 text-[10px] text-slate-500 whitespace-nowrap pl-4">폐기 (TCP=작업자, FE/FTIV=판정불가)</td>
+              <td className="px-3 py-2 font-bold text-slate-700 whitespace-nowrap">폐기 수량</td>
+              {scrapArr.map((v, i) => <td key={i} className="px-2 py-2 text-right tabular-nums text-slate-700">{v > 0 ? fmtNum(v) : '-'}</td>)}
+              <td className="px-3 py-2 text-right font-bold tabular-nums border-l-2 border-gray-300 text-slate-800">{fmtNum(scrapYTD)}</td>
             </tr>
             <tr className="bg-emerald-50 border-t-2 border-emerald-200">
               <td className="px-3 py-2 text-[10px] text-emerald-600 whitespace-nowrap pl-4">First Time Final Rate</td>
@@ -1347,7 +1441,7 @@ function PartTable({ data, year, process, processInfo, isIncluded }) {
     data.defect.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (r.process !== process || !m[r.part]) return;
-      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'defect')) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'defect', r.gubun)) return;
       m[r.part].defect += r.qty;
       const t = r.type || '(미분류)';
       m[r.part].defectTypes[t] = (m[r.part].defectTypes[t] || 0) + r.qty;
@@ -1507,7 +1601,7 @@ function MonthlyTypeTable({ data, year, activeProcesses, isIncluded }) {
     rows.forEach(r => {
       if (!r.date || r.date.getFullYear() !== year) return;
       if (!activeProcesses.includes(r.process)) return;
-      if (!isIncluded(r.process, r.lineName, r.station, r.type, kind)) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, kind, r.gubun)) return;
       const t = r.type || '(미분류)';
       if (!m[t]) m[t] = Array(12).fill(0);
       m[t][r.date.getMonth()] += r.qty;
@@ -1632,7 +1726,303 @@ function DetailTab({ data, year, activeProcesses, processStats, processInfo, isI
   );
 }
 
+// ─────────── SCORECARD TAB ───────────
+function Scorecard({ data, year, isIncluded }) {
+  const stats = useMemo(() => {
+    const empty = () => Array(12).fill(0);
+    const m = {};
+    const ensure = (p) => { if (!m[p]) m[p] = { good: empty(), rework: empty(), defect: empty(), scrap: empty() }; };
+    
+    data.good.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!isIncluded(r.process, r.lineName, null, null, 'good')) return;
+      ensure(r.process);
+      m[r.process].good[r.date.getMonth()] += r.qty;
+    });
+    data.rework.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'rework')) return;
+      ensure(r.process);
+      m[r.process].rework[r.date.getMonth()] += r.qty;
+    });
+    // defect와 scrap은 같은 raw(data.defect)에서 다른 필터로 누적
+    data.defect.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      const month = r.date.getMonth();
+      if (isIncluded(r.process, r.lineName, r.station, r.type, 'defect', r.gubun)) {
+        ensure(r.process);
+        m[r.process].defect[month] += r.qty;
+      }
+      if (isIncluded(r.process, r.lineName, r.station, r.type, 'scrap', r.gubun)) {
+        ensure(r.process);
+        m[r.process].scrap[month] += r.qty;
+      }
+    });
+    return m;
+  }, [data, year, isIncluded]);
+  
+  const fmt = (n) => n > 0 ? n.toLocaleString() : '-';
+  const sum = (arr) => arr.reduce((a, b) => a + b, 0);
+  
+  const getProcessSeries = (p, kind) => {
+    const ps = stats[p];
+    if (!ps) return Array(12).fill(0);
+    if (kind === 'input') return ps.good.map((g, i) => g + ps.defect[i]);
+    if (kind === 'scrap') return ps.scrap;
+    return ps[kind];
+  };
+  const getGroupSeries = (processes, kind) => {
+    const arr = Array(12).fill(0);
+    processes.forEach(p => {
+      const series = getProcessSeries(p, kind);
+      series.forEach((v, i) => arr[i] += v);
+    });
+    return arr;
+  };
+  
+  const METRICS = [
+    { key: 'good',   label: '완제품수량',  color: 'bg-emerald-50 text-emerald-900', borderColor: 'border-emerald-200', headerBg: 'bg-emerald-100', subBg: 'bg-emerald-50/50' },
+    { key: 'rework', label: '1차불량',     color: 'bg-amber-50 text-amber-900',     borderColor: 'border-amber-200',   headerBg: 'bg-amber-100',   subBg: 'bg-amber-50/50' },
+    { key: 'defect', label: '최종불량',     color: 'bg-red-50 text-red-900',         borderColor: 'border-red-200',     headerBg: 'bg-red-100',     subBg: 'bg-red-50/50' },
+    { key: 'input',  label: '총 투입수량',   color: 'bg-blue-50 text-blue-900',       borderColor: 'border-blue-200',    headerBg: 'bg-blue-100',    subBg: 'bg-blue-50/50' },
+    { key: 'scrap',  label: '폐기 수량',    color: 'bg-slate-100 text-slate-900',    borderColor: 'border-slate-300',   headerBg: 'bg-slate-200',   subBg: 'bg-slate-50' }
+  ];
+  
+  return (
+    <div className="space-y-4">
+      <div className="bg-white p-4 rounded-xl shadow-md">
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="text-xl font-bold text-gray-800">📑 {year} VG APAC Pyungtek Scorecard</h2>
+          <div className="text-xs text-gray-500">Quality Key Performance Metrics · 분석본 양식</div>
+        </div>
+      </div>
+      
+      <div className="bg-white rounded-xl shadow-md overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead className="sticky top-0 z-10">
+            <tr className="bg-gradient-to-r from-gray-700 to-gray-900 text-white">
+              <th className="px-3 py-2.5 text-left font-bold min-w-[180px]">Quality Key Performance Metric</th>
+              {MONTHS.map((m, i) => (
+                <th key={m} className="px-2 py-2 text-right font-bold min-w-[68px]">{m}</th>
+              ))}
+              <th className="px-3 py-2 text-right font-bold bg-amber-600 min-w-[80px]">{year} YTD</th>
+            </tr>
+          </thead>
+          <tbody>
+            {METRICS.map((metric, mIdx) => (
+              <React.Fragment key={metric.key}>
+                {/* 그룹 헤더 (예: Process Quality - 완제품수량) */}
+                <tr className={`${metric.headerBg} border-t-2 ${metric.borderColor}`}>
+                  <td colSpan="14" className={`px-3 py-2 font-bold ${metric.color} text-sm`}>
+                    ▌ {metric.label}
+                  </td>
+                </tr>
+                {SCORECARD_GROUPS.map(grp => {
+                  const procsInData = grp.processes.filter(p => stats[p]);
+                  if (procsInData.length === 0) return null;
+                  const groupSeries = getGroupSeries(procsInData, metric.key);
+                  const groupYtd = sum(groupSeries);
+                  
+                  return (
+                    <React.Fragment key={metric.key+'_'+grp.key}>
+                      {/* 라인 소계 (완제품수량_TCP 등) */}
+                      <tr className={`${metric.color} font-bold ${metric.subBg}`}>
+                        <td className="px-3 py-1.5 border-b border-gray-200">
+                          {metric.label}<span className="text-gray-500">_</span>{grp.label}
+                        </td>
+                        {groupSeries.map((v, i) => (
+                          <td key={i} className="px-2 py-1.5 text-right border-b border-gray-200">{fmt(v)}</td>
+                        ))}
+                        <td className="px-3 py-1.5 text-right border-b border-gray-200 bg-amber-100 font-bold">{fmt(groupYtd)}</td>
+                      </tr>
+                      {/* process 행 */}
+                      {procsInData.map(p => {
+                        const series = getProcessSeries(p, metric.key);
+                        const ytd = sum(series);
+                        return (
+                          <tr key={metric.key+'_'+grp.key+'_'+p} className="hover:bg-gray-100 border-b border-gray-100">
+                            <td className="px-3 py-1 pl-8 text-gray-600">{PROCESS_DISPLAY[p] || p}</td>
+                            {series.map((v, i) => (
+                              <td key={i} className="px-2 py-1 text-right text-gray-700">{fmt(v)}</td>
+                            ))}
+                            <td className="px-3 py-1 text-right text-gray-700 bg-amber-50 font-medium">{fmt(ytd)}</td>
+                          </tr>
+                        );
+                      })}
+                    </React.Fragment>
+                  );
+                })}
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      
+      <div className="bg-gray-50 p-3 rounded-lg text-xs text-gray-600">
+        💡 <b>총 투입수량</b> = 완제품수량 + 최종불량 (1차불량은 재작업 후 양품/불량으로 분류되므로 별도) · 모든 수치는 ⚙️ 집계 설정의 라인명/STATION/유형 필터를 따릅니다
+      </div>
+      
+      <ProcessDetailTabs data={data} year={year} isIncluded={isIncluded} />
+    </div>
+  );
+}
+
+// ─────────── PROCESS 별 PART FTFR 탭 (분석본 ICV/FLVV/... 시트) ───────────
+function ProcessDetailTabs({ data, year, isIncluded }) {
+  const [activeTab, setActiveTab] = useState('ICV');
+  const currentTab = PROCESS_TABS.find(t => t.key === activeTab) || PROCESS_TABS[0];
+  
+  // 현재 탭의 process들에 속한 part별 월별 통계
+  const partStats = useMemo(() => {
+    const empty = () => Array(12).fill(0);
+    const m = {};
+    const ensure = (k, process) => {
+      if (!m[k]) m[k] = { good: empty(), rework: empty(), defect: empty(), process };
+    };
+    const getKey = (r) => (r.part && r.part.trim()) || '(미분류)';
+    
+    data.good.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!currentTab.processes.includes(r.process)) return;
+      if (!isIncluded(r.process, r.lineName, null, null, 'good')) return;
+      const k = getKey(r);
+      ensure(k, r.process);
+      m[k].good[r.date.getMonth()] += r.qty;
+    });
+    data.defect.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!currentTab.processes.includes(r.process)) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'defect', r.gubun)) return;
+      const k = getKey(r);
+      ensure(k, r.process);
+      m[k].defect[r.date.getMonth()] += r.qty;
+    });
+    data.rework.forEach(r => {
+      if (!r.date || r.date.getFullYear() !== year) return;
+      if (!currentTab.processes.includes(r.process)) return;
+      if (!isIncluded(r.process, r.lineName, r.station, r.type, 'rework')) return;
+      const k = getKey(r);
+      ensure(k, r.process);
+      m[k].rework[r.date.getMonth()] += r.qty;
+    });
+    return m;
+  }, [data, year, currentTab, isIncluded]);
+  
+  const parts = useMemo(() => {
+    return Object.entries(partStats).map(([part, s]) => {
+      const input = s.good.map((g, i) => g + s.defect[i]);
+      const goodYTD = s.good.reduce((a, b) => a + b, 0);
+      const defectYTD = s.defect.reduce((a, b) => a + b, 0);
+      const reworkYTD = s.rework.reduce((a, b) => a + b, 0);
+      const inputYTD = goodYTD + defectYTD;
+      const ftfr = input.map((v, i) => v > 0 ? (s.rework[i] / v) * 1e6 : 0);
+      const ftfrYTD = inputYTD > 0 ? (reworkYTD / inputYTD) * 1e6 : 0;
+      return {
+        part, process: s.process, input, rework: s.rework, ftfr,
+        inputYTD, reworkYTD, ftfrYTD
+      };
+    })
+    .filter(p => p.inputYTD + p.reworkYTD > 0)
+    .sort((a, b) => b.inputYTD - a.inputYTD);
+  }, [partStats]);
+  
+  const fmtN = (n) => n > 0 ? n.toLocaleString() : '-';
+  const fmtPpm = (n) => n > 0 ? Math.round(n).toLocaleString() : '-';
+  
+  return (
+    <div className="bg-white rounded-xl shadow-md overflow-hidden">
+      <div className="px-4 py-3 bg-gradient-to-r from-indigo-700 to-blue-700 text-white">
+        <h3 className="text-lg font-bold">📐 Part 별 FTFR (분석본 시트 양식)</h3>
+        <p className="text-xs text-indigo-100 mt-0.5">품명별로 Total Test / FTFR 개수 / FTFR ppm 표시 · 🏷️ 품명 매핑 적용</p>
+      </div>
+      
+      {/* 탭 메뉴 */}
+      <div className="flex gap-1 px-4 pt-3 bg-gray-50 border-b border-gray-200 overflow-x-auto">
+        {PROCESS_TABS.map(t => (
+          <button key={t.key} onClick={() => setActiveTab(t.key)}
+            className={`px-4 py-2 rounded-t-lg font-bold text-sm transition whitespace-nowrap ${
+              activeTab === t.key 
+                ? 'bg-blue-600 text-white shadow' 
+                : 'bg-blue-100 text-blue-700 hover:bg-blue-200'
+            }`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      
+      <div className="overflow-x-auto">
+        {parts.length === 0 ? (
+          <div className="p-10 text-center text-gray-400">
+            <div className="text-4xl mb-2">📭</div>
+            <div>{currentTab.label} 데이터 없음 ({year})</div>
+            <div className="text-xs mt-1">집계 설정의 라인명/STATION 필터를 확인해주세요</div>
+          </div>
+        ) : (
+          <table className="w-full text-xs">
+            <thead className="bg-gray-100 sticky top-0">
+              <tr>
+                <th className="px-2 py-2 text-left font-bold text-gray-700 min-w-[100px]">Process</th>
+                <th className="px-2 py-2 text-left font-bold text-gray-700 min-w-[100px]">품명</th>
+                <th className="px-1 py-2 text-center font-bold text-gray-700 w-8">#</th>
+                <th className="px-2 py-2 text-left font-bold text-gray-700 min-w-[180px]">설명</th>
+                {MONTHS.map(m => (
+                  <th key={m} className="px-2 py-2 text-right font-bold text-gray-700 min-w-[68px]">{m}</th>
+                ))}
+                <th className="px-3 py-2 text-right font-bold text-gray-900 bg-amber-200 min-w-[80px]">YTD</th>
+              </tr>
+            </thead>
+            <tbody>
+              {parts.map((p, idx) => {
+                const procDisplay = PROCESS_DISPLAY[p.process] || p.process;
+                const bgGroup = idx % 2 === 0 ? 'bg-white' : 'bg-gray-50';
+                return (
+                  <React.Fragment key={p.part + '_' + p.process}>
+                    {/* 1행: Total Test */}
+                    <tr className={`${bgGroup} border-t-2 border-gray-300`}>
+                      <td rowSpan="3" className="px-2 py-1 text-gray-700 align-middle border-r border-gray-200">{procDisplay}</td>
+                      <td rowSpan="3" className="px-2 py-1 font-bold text-gray-800 align-middle border-r border-gray-200">{p.part}</td>
+                      <td className="px-1 py-0.5 text-center text-gray-500 text-[10px]">1</td>
+                      <td className="px-2 py-0.5 text-gray-600 text-[11px]">{p.part} Total Test 수량</td>
+                      {p.input.map((v, i) => (
+                        <td key={i} className="px-2 py-0.5 text-right tabular-nums">{fmtN(v)}</td>
+                      ))}
+                      <td className="px-3 py-0.5 text-right tabular-nums bg-amber-50 font-bold">{fmtN(p.inputYTD)}</td>
+                    </tr>
+                    {/* 2행: Total FTFR */}
+                    <tr className={bgGroup}>
+                      <td className="px-1 py-0.5 text-center text-gray-500 text-[10px]">2</td>
+                      <td className="px-2 py-0.5 text-gray-600 text-[11px]">{p.part} Total FTFR 개수</td>
+                      {p.rework.map((v, i) => (
+                        <td key={i} className="px-2 py-0.5 text-right tabular-nums text-amber-700">{fmtN(v)}</td>
+                      ))}
+                      <td className="px-3 py-0.5 text-right tabular-nums bg-amber-50 font-bold text-amber-700">{fmtN(p.reworkYTD)}</td>
+                    </tr>
+                    {/* 3행: FTFR ppm */}
+                    <tr className={`${bgGroup} font-bold`}>
+                      <td className="px-1 py-0.5 text-center text-gray-500 text-[10px]">3</td>
+                      <td className="px-2 py-0.5 text-emerald-700 text-[11px]">{p.part} FTFR (ppm)</td>
+                      {p.ftfr.map((v, i) => (
+                        <td key={i} className="px-2 py-0.5 text-right tabular-nums text-emerald-700">{fmtPpm(v)}</td>
+                      ))}
+                      <td className="px-3 py-0.5 text-right tabular-nums bg-emerald-100 text-emerald-800 font-bold">{fmtPpm(p.ftfrYTD)}</td>
+                    </tr>
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+      
+      <div className="p-3 bg-indigo-50 border-t border-indigo-100 text-xs text-indigo-700">
+        💡 품명 = 🏷️ 품명 매핑 적용된 값 (매핑 안 된 partno는 그대로 표시) · 같은 품명의 모든 partno 합산 · 사용량 많은 순으로 정렬
+      </div>
+    </div>
+  );
+}
+
 // ─────────── CONFIG MODAL ───────────
+
 // ─────────── PART ALIAS MODAL (partno → 품명) ───────────
 function PartAliasModal({ rawData, alias, onChange, onClose }) {
   const [local, setLocal] = useState(alias);
